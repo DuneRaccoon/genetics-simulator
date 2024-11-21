@@ -1,6 +1,7 @@
 import random
 import tkinter as tk
 from tkinter import ttk
+from typing import List
 import numpy as np
 import heapq
 
@@ -79,7 +80,6 @@ class Creature:
         # Creatures die naturally after exceeding their 'longevity' trait scaled lifespan
         lifespan = int(self.traits['longevity'] * 10) + 1  # Ensure at least lifespan of 1
         return self.age > lifespan
-    
 
     def act(self, simulation):
         # Decide action based on traits and needs
@@ -113,12 +113,11 @@ class Creature:
         target = None
         x0, y0 = self.position
         for (x1, y1), res_type in simulation.resources.items():
-            if res_type == resource_type:
-                distance = abs(x1 - x0) + abs(y1 - y0)
-                if distance <= vision_range:
-                    if min_distance is None or distance < min_distance:
-                        min_distance = distance
-                        target = (x1, y1)
+            distance = abs(x1 - x0) + abs(y1 - y0)
+            if res_type == resource_type and distance <= vision_range:
+                if min_distance is None or distance < min_distance:
+                    min_distance = distance
+                    target = (x1, y1)
         return target
 
     def find_target(self, simulation, vision_range):
@@ -262,8 +261,9 @@ class Creature:
 class Simulation:
     def __init__(self):
         self.population_size = Config.POPULATION_SIZE
-        self.population = []
+        self.population: List[Creature] = []
         self.wave = 0
+        self.revolution = 0
         self.environmental_factors = self.generate_environmental_factors()
         self.grid = self.create_grid()
         self.obstacles = set()
@@ -272,6 +272,7 @@ class Simulation:
         self.place_obstacles()
         self.place_resources()
         self.create_population()
+        self.total_revolutions = 0  # Total number of revolutions run
 
     def generate_environmental_factors(self):
         # Environmental factors can affect the fitness calculation
@@ -308,26 +309,58 @@ class Simulation:
     def create_population(self):
         # Ensure creatures don't spawn on obstacles or resources
         for _ in range(self.population_size):
-            creature = Creature()
+            position = self.random_free_position()
+            creature = Creature(position=position)
             self.population.append(creature)
 
+    def random_free_position(self):
+        while True:
+            x = random.randint(0, Config.GRID_SIZE - 1)
+            y = random.randint(0, Config.GRID_SIZE - 1)
+            if (x, y) not in self.obstacles and (x, y) not in self.resources and not any(c.position == (x, y) for c in self.population):
+                return (x, y)
+
+    # def run_wave(self):
+    #     self.wave += 1
+    #     self.revolution = 0
+    #     self.events.append(f"--- Wave {self.wave} ---")
+    #     for _ in range(Config.REVOLUTIONS_PER_WAVE):
+    #         self.revolution += 1
+    #         self.run_revolution()
+    #         # Pause between revolutions if needed
+    #         if self.gui and self.gui.paused:
+    #             break  # Break out to wait for unpause
+    #     self.cull_population()
+    #     self.reproduce_population()
+    #     self.age_population()
+    #     # Update environmental factors occasionally
+    #     if self.wave % 10 == 0:
+    #         self.environmental_factors = self.generate_environmental_factors()
+    #     # Update stats for GUI
+    #     self.update_stats()
+
+    # def run_revolution(self):
+    #     # Clear events for this revolution
+    #     self.events.append(f"Revolution {self.revolution} in Wave {self.wave}")
+    #     # Update grid with current positions
+    #     self.update_grid()
+    #     for creature in self.population:
+    #         if creature.alive:
+    #             creature.act(self)
+    #     # Remove dead creatures from grid
+    #     self.update_grid()
+
     def run_wave(self):
+        # Prepare for a new wave
         self.wave += 1
+        self.revolution = 0
         self.events.append(f"--- Wave {self.wave} ---")
-        for _ in range(Config.REVOLUTIONS_PER_WAVE):
-            self.run_revolution()
-        self.cull_population()
-        self.reproduce_population()
-        self.age_population()
-        # Update environmental factors occasionally
         if self.wave % 10 == 0:
             self.environmental_factors = self.generate_environmental_factors()
-        # Update stats for GUI
-        self.update_stats()
 
     def run_revolution(self):
-        # Clear events for this revolution
-        self.events.append(f"Revolution in Wave {self.wave}")
+        self.revolution += 1
+        self.events.append(f"Revolution {self.revolution} in Wave {self.wave}")
         # Update grid with current positions
         self.update_grid()
         for creature in self.population:
@@ -335,7 +368,15 @@ class Simulation:
                 creature.act(self)
         # Remove dead creatures from grid
         self.update_grid()
+        self.total_revolutions += 1
+        self.update_stats()
+        
+    def is_wave_complete(self):
+        return self.revolution >= Config.REVOLUTIONS_PER_WAVE
 
+    def is_simulation_complete(self):
+        return self.wave >= Config.NUM_WAVES or len(self.population) == 0
+        
     def update_grid(self):
         self.grid = [[None for _ in range(Config.GRID_SIZE)] for _ in range(Config.GRID_SIZE)]
         for x, y in self.obstacles:
@@ -392,7 +433,8 @@ class Simulation:
         while len(self.population) + len(offspring) < self.population_size:
             parent1, parent2 = self.select_mates()
             child_chromosomes = self.reproduce(parent1, parent2)
-            child = Creature(chromosomes=child_chromosomes)
+            child_position = self.random_free_position()
+            child = Creature(chromosomes=child_chromosomes, position=child_position)
             offspring.append(child)
         self.population.extend(offspring)
         self.events.append(f"Reproduced {len(offspring)} offspring.")
@@ -458,6 +500,8 @@ class Simulation:
 
     def simulate(self):
         for _ in range(Config.NUM_WAVES):
+            if self.gui and self.gui.paused:
+                break  # Break if simulation is paused
             self.run_wave()
             if len(self.population) == 0:
                 self.events.append("All creatures have died. Simulation ended.")
@@ -471,18 +515,22 @@ class Simulation:
         else:
             self.average_fitness = 0
 
+    def set_gui(self, gui):
+        self.gui = gui
+
 class SimulationGUI:
     def __init__(self):
         self.simulation = None
         self.root = tk.Tk()
         self.root.title("Evolution Simulator")
+        self.paused = False
         self.create_configuration_interface()
 
     def create_configuration_interface(self):
         # Create GUI elements to set configuration
         self.config_frame = tk.Frame(self.root)
         self.config_frame.pack(pady=10)
-        
+
         self.population_size_var = tk.IntVar(value=Config.POPULATION_SIZE)
         self.num_chromosomes_var = tk.IntVar(value=Config.NUM_CHROMOSOMES)
         self.genes_per_chromosome_var = tk.IntVar(value=Config.GENES_PER_CHROMOSOME)
@@ -537,6 +585,7 @@ class SimulationGUI:
         # Initialize simulation
         global simulation
         simulation = Simulation()
+        simulation.set_gui(self)
         self.simulation = simulation
         self.canvas_size = 600
 
@@ -561,8 +610,20 @@ class SimulationGUI:
         self.population_label.pack()
         self.fitness_label = tk.Label(self.stats_frame, text="")
         self.fitness_label.pack()
+        self.wave_label = tk.Label(self.stats_frame, text="")
+        self.wave_label.pack()
+        self.revolution_label = tk.Label(self.stats_frame, text="")
+        self.revolution_label.pack()
         self.creature_info_label = tk.Label(self.stats_frame, text="", justify=tk.LEFT)
         self.creature_info_label.pack(pady=20)
+
+        # Create pause/play buttons
+        self.button_frame = tk.Frame(self.stats_frame)
+        self.button_frame.pack(pady=10)
+        self.pause_button = tk.Button(self.button_frame, text="Pause", command=self.pause_simulation)
+        self.pause_button.pack(side=tk.LEFT, padx=5)
+        self.play_button = tk.Button(self.button_frame, text="Play", command=self.play_simulation)
+        self.play_button.pack(side=tk.LEFT, padx=5)
 
         # Create event log window
         self.event_log_window = tk.Toplevel(self.root)
@@ -571,7 +632,7 @@ class SimulationGUI:
         self.event_log_text.pack()
 
         self.draw_population()
-        self.root.after(1000, self.next_wave)
+        self.root.after(1000, self.run_simulation)
 
     def generate_gene_names_and_traits(self):
         global gene_names, traits_list, gene_trait_mapping, trait_weights
@@ -606,7 +667,7 @@ class SimulationGUI:
         self.canvas.delete("all")
         cell_size = self.canvas_size // Config.GRID_SIZE
 
-        # Draw obstacles
+        # Draw obstacles, resources, and creatures
         for y in range(Config.GRID_SIZE):
             for x in range(Config.GRID_SIZE):
                 x0 = x * cell_size
@@ -614,15 +675,11 @@ class SimulationGUI:
                 x1 = x0 + cell_size
                 y1 = y0 + cell_size
                 if (x, y) in self.simulation.obstacles:
-                    self.canvas.create_rectangle(
-                        x0, y0, x1, y1, fill='gray', outline=""
-                    )
+                    self.canvas.create_rectangle(x0, y0, x1, y1, fill='gray', outline="")
                 elif (x, y) in self.simulation.resources:
                     res_type = self.simulation.resources[(x, y)]
                     color = 'yellow' if res_type == 'food' else 'blue'
-                    self.canvas.create_rectangle(
-                        x0, y0, x1, y1, fill=color, outline=""
-                    )
+                    self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
         # Draw creatures
         for creature in self.simulation.population:
             if creature.alive:
@@ -631,13 +688,9 @@ class SimulationGUI:
                 y0 = y * cell_size
                 x1 = x0 + cell_size
                 y1 = y0 + cell_size
-                self.canvas.create_rectangle(
-                    x0, y0, x1, y1, fill=creature.color, outline=""
-                )
-        # Update stats display
+                self.canvas.create_rectangle(x0, y0, x1, y1, fill=creature.color, outline="")
+        # Update stats and event log
         self.update_stats_display()
-
-        # Update event log
         self.update_event_log()
 
     def on_mouse_move(self, event):
@@ -647,36 +700,67 @@ class SimulationGUI:
         y = event.y // cell_size
         x = min(max(x, 0), Config.GRID_SIZE - 1)
         y = min(max(y, 0), Config.GRID_SIZE - 1)
-        # Check if there's a creature at this position
-        creature = None
+        # Check what's at this position
+        info = ""
         for c in self.simulation.population:
             if c.alive and c.position == (x, y):
-                creature = c
+                # Creature info
+                info += f"Creature at ({x}, {y}):\n"
+                for trait, value in c.traits.items():
+                    info += f"{trait.capitalize()}: {value:.2f}\n"
+                info += f"Hunger: {c.hunger}\n"
+                info += f"Thirst: {c.thirst}\n"
+                info += f"Age: {c.age}\n"
                 break
-        if creature:
-            info = f"Creature at ({x}, {y}):\n"
-            for trait, value in creature.traits.items():
-                info += f"{trait.capitalize()}: {value:.2f}\n"
-            info += f"Hunger: {creature.hunger}\n"
-            info += f"Thirst: {creature.thirst}\n"
-            info += f"Age: {creature.age}\n"
-            self.creature_info_label.config(text=info)
         else:
-            self.creature_info_label.config(text="")
-
-    def next_wave(self):
-        if self.simulation:
-            self.simulation.run_wave()
-            self.draw_population()
-            if len(self.simulation.population) > 0:
-                self.root.after(1000, self.next_wave)
+            if (x, y) in self.simulation.resources:
+                res_type = self.simulation.resources[(x, y)]
+                info += f"Resource at ({x}, {y}): {res_type.capitalize()}\n"
+            elif (x, y) in self.simulation.obstacles:
+                info += f"Obstacle at ({x}, {y})\n"
             else:
-                print("All creatures have died. Simulation ended.")
+                info += f"Empty cell at ({x}, {y})\n"
+        self.creature_info_label.config(text=info)
+
+    def run_simulation(self):
+        if not self.paused and self.simulation:
+            if self.simulation.is_wave_complete():
+                # End-of-wave processing
+                self.simulation.cull_population()
+                self.simulation.reproduce_population()
+                self.simulation.age_population()
+                if self.simulation.is_simulation_complete():
+                    print("Simulation ended.")
+                    self.root.destroy()
+                    return
+                else:
+                    self.simulation.run_wave()
+            else:
+                self.simulation.run_revolution()
+                self.draw_population()
+            if self.simulation.is_simulation_complete():
+                print("Simulation ended.")
                 self.root.destroy()
+            else:
+                self.root.after(500, self.run_simulation)
+        else:
+            # Check again after some time if paused
+            self.root.after(500, self.run_simulation)
+
+
+    def pause_simulation(self):
+        self.paused = True
+
+    def play_simulation(self):
+        if self.paused:
+            self.paused = False
+            self.run_simulation()
 
     def update_stats_display(self):
         self.population_label.config(text=f"Population Size: {self.simulation.total_population}")
         self.fitness_label.config(text=f"Average Fitness: {self.simulation.average_fitness:.2f}")
+        self.wave_label.config(text=f"Current Wave: {self.simulation.wave}")
+        self.revolution_label.config(text=f"Current Revolution: {self.simulation.revolution}")
 
     def update_event_log(self):
         self.event_log_text.config(state='normal')
