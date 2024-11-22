@@ -104,8 +104,9 @@ class Creature:
             if target:
                 self.move_towards_target(simulation, target.position, intelligence, attack_target=target)
                 return
+
         # General movement
-        self.move(simulation, intelligence)
+        self.move(simulation, intelligence, vision_range)
 
     def find_resource(self, simulation, resource_type, vision_range):
         # Find the nearest resource of the given type within vision range
@@ -159,23 +160,69 @@ class Creature:
             # Can't find path, stay in place
             pass
 
-    def move(self, simulation, intelligence):
-        # General movement based on intelligence
+    def move(self, simulation, intelligence, vision_range):
+        # Enhanced general movement based on intelligence and vision
         if intelligence > 0.7:
-            # High intelligence: Move towards a goal (e.g., center of the grid)
-            goal = (Config.GRID_SIZE // 2, Config.GRID_SIZE // 2)
-            path = self.a_star_pathfinding(simulation, goal)
-            if path:
-                self.position = path[0]
+            # High intelligence: Analyze surroundings and choose best path
+            target = self.find_best_tile(simulation, vision_range)
+            if target:
+                path = self.a_star_pathfinding(simulation, target)
+                if path:
+                    self.position = path[0]
+                else:
+                    self.position = self.random_adjacent_position(simulation)
+            else:
+                self.position = self.random_adjacent_position(simulation)
         elif intelligence > 0.4:
-            # Medium intelligence: Greedy movement towards goal
-            goal = (Config.GRID_SIZE // 2, Config.GRID_SIZE // 2)
-            path = self.greedy_move(simulation, goal)
-            if path:
-                self.position = path[0]
+            # Medium intelligence: Move towards tile with resources or fewer creatures
+            target = self.find_best_tile(simulation, vision_range)
+            if target:
+                path = self.greedy_move(simulation, target)
+                if path:
+                    self.position = path[0]
+                else:
+                    self.position = self.random_adjacent_position(simulation)
+            else:
+                self.position = self.random_adjacent_position(simulation)
         else:
             # Low intelligence: Random movement
             self.position = self.random_adjacent_position(simulation)
+
+    def find_best_tile(self, simulation, vision_range):
+        # Analyze surroundings to find the best tile to move towards
+        best_score = -float('inf')
+        best_tile = None
+        x0, y0 = self.position
+        for dx in range(-vision_range, vision_range + 1):
+            for dy in range(-vision_range, vision_range + 1):
+                x = (x0 + dx) % Config.GRID_SIZE
+                y = (y0 + dy) % Config.GRID_SIZE
+                if (x, y) == (x0, y0):
+                    continue
+                # Evaluate tile
+                score = self.evaluate_tile(simulation, x, y)
+                if score > best_score:
+                    best_score = score
+                    best_tile = (x, y)
+        return best_tile
+
+    def evaluate_tile(self, simulation, x, y):
+        # Assign a score to the tile based on certain criteria
+        score = 0
+        cell = simulation.grid[y][x]
+        if cell is None:
+            score += 1  # Prefer empty cells
+        elif cell in ['food', 'water']:
+            score += 5  # Prefer resource tiles
+        elif isinstance(cell, Creature):
+            # Avoid tiles with other creatures unless aggressive
+            if self.traits['aggression'] > 0.7:
+                score += 2  # May want to attack
+            else:
+                score -= 5  # Avoid confrontation
+        if (x, y) in simulation.obstacles:
+            score -= 10  # Avoid obstacles
+        return score
 
     def attack(self, target, simulation):
         # Simple attack logic
@@ -184,6 +231,8 @@ class Creature:
         if attack_power > defense_power:
             target.alive = False  # Target dies
             simulation.events.append(f"Creature at {self.position} killed creature at {target.position}")
+            # Consume the creature as food
+            self.consume_creature(target, simulation)
         else:
             simulation.events.append(f"Creature at {self.position} failed to kill creature at {target.position}")
 
@@ -194,6 +243,11 @@ class Creature:
         elif resource_type == 'water':
             self.thirst = max(self.thirst - 50, 0)
         simulation.events.append(f"Creature at {self.position} consumed {resource_type}")
+
+    def consume_creature(self, target, simulation):
+        # Consuming the defeated creature reduces hunger significantly
+        self.hunger = max(self.hunger - 70, 0)
+        simulation.events.append(f"Creature at {self.position} consumed creature at {target.position}")
 
     def random_adjacent_position(self, simulation):
         x, y = self.position
@@ -210,6 +264,7 @@ class Creature:
         dx = 1 if gx > x else -1 if gx < x else 0
         dy = 1 if gy > y else -1 if gy < y else 0
         new_positions = [(x + dx, y), (x, y + dy), (x + dx, y + dy)]
+        random.shuffle(new_positions)  # Shuffle to add some randomness
         for nx, ny in new_positions:
             nx %= Config.GRID_SIZE
             ny %= Config.GRID_SIZE
@@ -257,7 +312,7 @@ class Creature:
             total_path.insert(0, current)
         # Exclude the starting position
         return total_path[1:]
-
+    
 class Simulation:
     def __init__(self):
         self.population_size = Config.POPULATION_SIZE
@@ -268,18 +323,21 @@ class Simulation:
         self.grid = self.create_grid()
         self.obstacles = set()
         self.resources = {}
-        self.events = []  # List to store events
+        self.events: List[str] = []
+        self.total_revolutions: int = 0
+        
         self.place_obstacles()
         self.place_resources()
         self.create_population()
-        self.total_revolutions = 0  # Total number of revolutions run
 
     def generate_environmental_factors(self):
         # Environmental factors can affect the fitness calculation
         factors = {
             'temperature': random.uniform(0, 1),  # 0: cold, 1: hot
             'predation': random.uniform(0, 1),    # Level of predation
-            'resource_abundance': random.uniform(0, 1)  # Availability of resources
+            'resource_abundance': random.uniform(0, 1),  # Availability of resources
+            'disease': random.uniform(0, 1),      # Disease prevalence
+            'natural_disasters': random.uniform(0, 1)  # Frequency of natural disasters
         }
         return factors
 
