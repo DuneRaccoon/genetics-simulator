@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import random
 import tkinter as tk
 from tkinter import ttk
-from typing import List
-import numpy as np
+from typing import List, Dict, Tuple, Union
 import heapq
 
 from config import Config
@@ -10,9 +11,21 @@ from config import Config
 # Generate gene names (will be updated after configuration)
 gene_names = []
 traits_list = []
+gene_trait_mapping = {}
+trait_weights = {}
+
+def split(x, y):
+    return [x // y + (1 if x % y > i else 0) for i in range(y)]
 
 class Creature:
-    def __init__(self, chromosomes=None, position=None):
+    def __init__(
+        self,
+        simulation: Simulation,
+        *,
+        chromosomes=None, 
+        position=None
+    ):
+        self.simulation = simulation
         self.num_chromosomes = Config.NUM_CHROMOSOMES
         self.genes_per_chromosome = Config.GENES_PER_CHROMOSOME
         self.chromosomes = chromosomes if chromosomes else self.generate_chromosomes()
@@ -27,6 +40,13 @@ class Creature:
         self.fitness = self.calculate_fitness()
         self.target = None  # Target position for pathfinding
         self.path = []      # Path to follow
+        self.known_resources: Dict[Tuple[int, int], Dict[str, any]] = {}  # Resources known to the creature
+        self.reproduction_cooldown = 0  # Cooldown period after reproduction
+        self.mate: Union[Creature, None] = None  # Current mate target
+        self.reproduction_counter = 0  # Number of successful reproductions
+        self.current_thought = ""  # Current action or thought
+        self.thoughts = []  # Log of actions and thoughts
+        self.cause_of_death = ""  # Reason for death
 
     def generate_chromosomes(self):
         # Each gene is a continuous value between 0 and 1
@@ -51,17 +71,26 @@ class Creature:
             self.traits[trait] = max(min(self.traits[trait], 1), 0)
 
     def calculate_color(self):
-        # Map selected traits to RGB values
-        r_trait = 'aggression'
-        g_trait = 'camouflage'
-        b_trait = 'vision'
-        r = int(50 + self.traits[r_trait] * 205)   # Scale to 50-255
-        g = int(50 + self.traits[g_trait] * 205)
-        b = int(50 + self.traits[b_trait] * 205)
+        # Define traits for each color channel
+        r_traits = ['aggression', 'strength', 'speed']
+        g_traits = ['camouflage', 'endurance', 'longevity']
+        b_traits = ['vision', 'intelligence', 'hearing']
+
+        # Calculate average trait values for each channel
+        r_avg = sum(self.traits[trait] for trait in r_traits) / len(r_traits)
+        g_avg = sum(self.traits[trait] for trait in g_traits) / len(g_traits)
+        b_avg = sum(self.traits[trait] for trait in b_traits) / len(b_traits)
+
+        # Scale averages to RGB values (50-255)
+        r = int(50 + r_avg * 205)
+        g = int(50 + g_avg * 205)
+        b = int(50 + b_avg * 205)
+
         # Ensure RGB values are within 0-255
         r = min(max(0, r), 255)
         g = min(max(0, g), 255)
         b = min(max(0, b), 255)
+
         return f'#{r:02x}{g:02x}{b:02x}'
 
     def calculate_fitness(self):
@@ -71,20 +100,54 @@ class Creature:
 
     def age_creature(self):
         self.age += 1
+        
+        # Decrease reproduction cooldown
+        if self.reproduction_cooldown > 0:
+            self.reproduction_cooldown -= 1
+            
         # Increase hunger and thirst
         self.hunger += 5
         self.thirst += 5
         if self.hunger >= 100 or self.thirst >= 100:
             self.alive = False  # Dies from starvation or dehydration
+            self.cause_of_death = "Starvation/Dehydration"
+            self.simulation.events.append(f"Creature at {self.position} died of hunger or thirst.")
+            self.simulation.add_to_graveyard(self)
             return True
+        
         # Creatures die naturally after exceeding their 'longevity' trait scaled lifespan
         lifespan = int(self.traits['longevity'] * 10) + 1  # Ensure at least lifespan of 1
-        return self.age > lifespan
+        died = self.age > lifespan
+        if died:
+            self.alive = False
+            self.cause_of_death = "Old Age"
+            self.simulation.events.append(f"Creature at {self.position} died of old age.")
+            self.simulation.add_to_graveyard(self)
+            
+        return died
 
-    def act(self, simulation):
+    def is_culled(self, fitness_threshold):
+        """
+        Other culling criteria can be added here, such as disease, natural disasters, etc.
+
+        If the creature is culled, returns True, otherwise False.
+        """
+        # Check if creature should be culled based on fitness
+        if self.fitness < fitness_threshold:
+            self.alive = False
+            self.cause_of_death = "Culled due to Low Fitness"
+            self.simulation.events.append(f"Creature at {self.position} culled due to low fitness.")
+            self.simulation.add_to_graveyard(self)
+            return True
+        return False
+
+    def act(self):
         # Decide action based on traits and needs
         if not self.alive:
             return
+
+        # Scan surroundings to update known resources
+        self.scan_surroundings()
 
         # Use different pathfinding algorithms based on intelligence
         intelligence = self.traits['intelligence']
@@ -93,40 +156,60 @@ class Creature:
         # Check hunger and thirst levels; seek resources if necessary
         if self.hunger > 50 or self.thirst > 50:
             resource_type = 'food' if self.hunger > self.thirst else 'water'
-            target = self.find_resource(simulation, resource_type, vision_range)
+            target = self.find_resource(resource_type)
             if target:
-                self.move_towards_target(simulation, target, intelligence)
+                self.move_towards_target(target, intelligence)
+                self.current_thought = f"Seeking {resource_type}"
+                return
+
+        # Attempt reproduction if not hungry/thirsty and not in cooldown
+        if self.reproduction_cooldown == 0 and self.traits['fertility'] > 0.5:
+            mate = self.find_mate(vision_range)
+            if mate:
+                self.mate = mate
+                self.move_towards_target(mate.position, intelligence, mate_target=mate)
+                self.current_thought = f"Seeking mate at {mate.position}"
                 return
 
         # High aggression creatures seek targets
         if self.traits['aggression'] > 0.7:
-            target = self.find_target(simulation, vision_range)
+            target = self.find_target(vision_range)
             if target:
-                self.move_towards_target(simulation, target.position, intelligence, attack_target=target)
+                self.move_towards_target(target.position, intelligence, attack_target=target)
+                self.current_thought = f"Attacking creature at {target.position}"
                 return
 
         # General movement
-        self.move(simulation, intelligence, vision_range)
+        self.move(simulation, intelligence)
 
     def find_resource(self, simulation, resource_type, vision_range):
         # Find the nearest resource of the given type within vision range
         min_distance = None
         target = None
         x0, y0 = self.position
-        for (x1, y1), res_type in simulation.resources.items():
-            distance = abs(x1 - x0) + abs(y1 - y0)
-            if res_type == resource_type and distance <= vision_range:
+        for (x1, y1), res in self.known_resources.items():
+            if res['type'] == resource_type and not res.get('claimed', False):
+                distance = abs(x1 - x0) + abs(y1 - y0)
                 if min_distance is None or distance < min_distance:
                     min_distance = distance
                     target = (x1, y1)
+        # Claim the resource if found
+        if target:
+            self.simulation.resources[target]['claimed'] = True
+            self.target_resource = target
+            # Update GUI immediately to reflect claimed resource
+            if self.simulation.gui:
+                self.simulation.gui.draw_population()
+        else:
+            self.target_resource = None
         return target
 
-    def find_target(self, simulation, vision_range):
+    def find_target(self, vision_range):
         # Find the nearest creature to attack within vision range
         min_distance = None
         target = None
         x0, y0 = self.position
-        for creature in simulation.population:
+        for creature in self.simulation.population:
             if creature != self and creature.alive:
                 x1, y1 = creature.position
                 distance = abs(x1 - x0) + abs(y1 - y0)
@@ -135,94 +218,82 @@ class Creature:
                         min_distance = distance
                         target = creature
         return target
+    
+    def find_mate(self, vision_range):
+        # Find the nearest eligible mate within vision range
+        min_distance = None
+        potential_mate = None
+        x0, y0 = self.position
+        for creature in self.simulation.population:
+            if creature != self and creature.alive and creature.reproduction_cooldown == 0:
+                if creature.traits['fertility'] > 0.5 and creature.hunger <= 50 and creature.thirst <= 50:
+                    x1, y1 = creature.position
+                    distance = abs(x1 - x0) + abs(y1 - y0)
+                    if distance <= vision_range:
+                        if min_distance is None or distance < min_distance:
+                            min_distance = distance
+                            potential_mate = creature
+        return potential_mate
 
-    def move_towards_target(self, simulation, target_position, intelligence, attack_target=None):
+    def move_towards_target(self, target_position, intelligence, attack_target: Creature=None, mate_target: Creature=None):
+        # Check if target is still valid before moving
+        if attack_target and not attack_target.alive:
+            # Target is dead, abandon action
+            return
+        elif mate_target and (not mate_target.alive or mate_target.reproduction_cooldown > 0):
+            # Mate is no longer available
+            self.mate = None
+            return
+        elif not attack_target and not mate_target and self.target_resource:
+            # Check if resource still exists and is not claimed
+            resource = self.simulation.resources.get(self.target_resource)
+            if not resource or resource.get('claimed', False):
+                # Resource no longer available
+                self.target_resource = None
+                return
+
         # Determine pathfinding method based on intelligence
-        if intelligence > 0.7:
+        if intelligence > 0.6:
             # High intelligence: Use A* pathfinding
-            path = self.a_star_pathfinding(simulation, target_position)
-        elif intelligence > 0.4:
+            path = self.a_star_pathfinding(target_position)
+        elif intelligence > 0.35:
             # Medium intelligence: Greedy movement
-            path = self.greedy_move(simulation, target_position)
+            path = self.greedy_move(target_position)
         else:
             # Low intelligence: Random movement
-            path = [self.random_adjacent_position(simulation)]
+            path = [self.random_adjacent_position()]
         if path:
             next_position = path[0]
             self.position = next_position
             # Check if reached target
             if self.position == target_position:
                 if attack_target:
-                    self.attack(attack_target, simulation)
+                    self.attack(attack_target)
+                elif mate_target:
+                    self.attempt_reproduction(mate_target)
                 else:
-                    self.consume_resource(simulation, target_position)
+                    self.consume_resource(target_position)
         else:
             # Can't find path, stay in place
             pass
 
-    def move(self, simulation, intelligence, vision_range):
-        # Enhanced general movement based on intelligence and vision
+    def move(self, simulation, intelligence):
+        # General movement based on intelligence
         if intelligence > 0.7:
-            # High intelligence: Analyze surroundings and choose best path
-            target = self.find_best_tile(simulation, vision_range)
-            if target:
-                path = self.a_star_pathfinding(simulation, target)
-                if path:
-                    self.position = path[0]
-                else:
-                    self.position = self.random_adjacent_position(simulation)
-            else:
-                self.position = self.random_adjacent_position(simulation)
+            # High intelligence: Move towards a goal (e.g., center of the grid)
+            goal = (Config.GRID_SIZE // 2, Config.GRID_SIZE // 2)
+            path = self.a_star_pathfinding(simulation, goal)
+            if path:
+                self.position = path[0]
         elif intelligence > 0.4:
-            # Medium intelligence: Move towards tile with resources or fewer creatures
-            target = self.find_best_tile(simulation, vision_range)
-            if target:
-                path = self.greedy_move(simulation, target)
-                if path:
-                    self.position = path[0]
-                else:
-                    self.position = self.random_adjacent_position(simulation)
-            else:
-                self.position = self.random_adjacent_position(simulation)
+            # Medium intelligence: Greedy movement towards goal
+            goal = (Config.GRID_SIZE // 2, Config.GRID_SIZE // 2)
+            path = self.greedy_move(simulation, goal)
+            if path:
+                self.position = path[0]
         else:
             # Low intelligence: Random movement
             self.position = self.random_adjacent_position(simulation)
-
-    def find_best_tile(self, simulation, vision_range):
-        # Analyze surroundings to find the best tile to move towards
-        best_score = -float('inf')
-        best_tile = None
-        x0, y0 = self.position
-        for dx in range(-vision_range, vision_range + 1):
-            for dy in range(-vision_range, vision_range + 1):
-                x = (x0 + dx) % Config.GRID_SIZE
-                y = (y0 + dy) % Config.GRID_SIZE
-                if (x, y) == (x0, y0):
-                    continue
-                # Evaluate tile
-                score = self.evaluate_tile(simulation, x, y)
-                if score > best_score:
-                    best_score = score
-                    best_tile = (x, y)
-        return best_tile
-
-    def evaluate_tile(self, simulation, x, y):
-        # Assign a score to the tile based on certain criteria
-        score = 0
-        cell = simulation.grid[y][x]
-        if cell is None:
-            score += 1  # Prefer empty cells
-        elif cell in ['food', 'water']:
-            score += 5  # Prefer resource tiles
-        elif isinstance(cell, Creature):
-            # Avoid tiles with other creatures unless aggressive
-            if self.traits['aggression'] > 0.7:
-                score += 2  # May want to attack
-            else:
-                score -= 5  # Avoid confrontation
-        if (x, y) in simulation.obstacles:
-            score -= 10  # Avoid obstacles
-        return score
 
     def attack(self, target, simulation):
         # Simple attack logic
@@ -231,10 +302,8 @@ class Creature:
         if attack_power > defense_power:
             target.alive = False  # Target dies
             simulation.events.append(f"Creature at {self.position} killed creature at {target.position}")
-            # Consume the creature as food
-            self.consume_creature(target, simulation)
         else:
-            simulation.events.append(f"Creature at {self.position} failed to kill creature at {target.position}")
+            self.simulation.events.append(f"Creature at {self.position} failed to kill creature at {target.position}")
 
     def consume_resource(self, simulation, position):
         resource_type = simulation.resources.pop(position)
@@ -244,20 +313,15 @@ class Creature:
             self.thirst = max(self.thirst - 50, 0)
         simulation.events.append(f"Creature at {self.position} consumed {resource_type}")
 
-    def consume_creature(self, target, simulation):
-        # Consuming the defeated creature reduces hunger significantly
-        self.hunger = max(self.hunger - 70, 0)
-        simulation.events.append(f"Creature at {self.position} consumed creature at {target.position}")
-
     def random_adjacent_position(self, simulation):
         x, y = self.position
-        adjacent_positions = simulation.get_adjacent_positions(x, y)
+        adjacent_positions = self.simulation.get_adjacent_positions(x, y)
         if adjacent_positions:
             return random.choice(adjacent_positions)
         else:
             return self.position
 
-    def greedy_move(self, simulation, goal):
+    def greedy_move(self, goal):
         # Move towards the goal if adjacent cell is free
         x, y = self.position
         gx, gy = goal
@@ -268,14 +332,14 @@ class Creature:
         for nx, ny in new_positions:
             nx %= Config.GRID_SIZE
             ny %= Config.GRID_SIZE
-            if simulation.is_cell_free(nx, ny):
+            if self.simulation.is_cell_free(nx, ny):
                 return [(nx, ny)]
         # If can't move towards goal, stay in place
         return None
 
-    def a_star_pathfinding(self, simulation, goal):
+    def a_star_pathfinding(self, goal):
         start = self.position
-        grid = simulation.grid
+        grid = self.simulation.grid
         open_set = []
         heapq.heappush(open_set, (0, start))
         came_from = {}
@@ -286,11 +350,11 @@ class Creature:
             _, current = heapq.heappop(open_set)
             if current == goal:
                 return self.reconstruct_path(came_from, current)
-            for neighbor in simulation.get_adjacent_positions(*current):
+            for neighbor in self.simulation.get_adjacent_positions(*current):
                 tentative_g_score = g_score[current] + 1  # Assuming cost = 1
                 if neighbor in g_score and tentative_g_score >= g_score[neighbor]:
                     continue
-                if not simulation.is_cell_free(*neighbor) and neighbor != goal:
+                if not self.simulation.is_cell_free(*neighbor) and neighbor != goal:
                     continue
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_g_score
@@ -315,20 +379,21 @@ class Creature:
     
 class Simulation:
     def __init__(self):
+        
         self.population_size = Config.POPULATION_SIZE
         self.population: List[Creature] = []
+        self.new_offspring: List[Creature] = []  # Offspring to be added after revolution
         self.wave = 0
         self.revolution = 0
         self.environmental_factors = self.generate_environmental_factors()
         self.grid = self.create_grid()
         self.obstacles = set()
         self.resources = {}
-        self.events: List[str] = []
-        self.total_revolutions: int = 0
-        
+        self.events = []  # List to store events
         self.place_obstacles()
         self.place_resources()
         self.create_population()
+        self.total_revolutions = 0  # Total number of revolutions run
 
     def generate_environmental_factors(self):
         # Environmental factors can affect the fitness calculation
@@ -362,13 +427,16 @@ class Simulation:
             y = random.randint(0, Config.GRID_SIZE - 1)
             if (x, y) not in self.obstacles and (x, y) not in self.resources:
                 res_type = random.choice(resource_types)
-                self.resources[(x, y)] = res_type
+                self.resources[(x, y)] = {
+                    "type": res_type,
+                    "claimed": False
+                }
 
     def create_population(self):
         # Ensure creatures don't spawn on obstacles or resources
         for _ in range(self.population_size):
             position = self.random_free_position()
-            creature = Creature(position=position)
+            creature = Creature(self, position=position)
             self.population.append(creature)
 
     def random_free_position(self):
@@ -377,36 +445,16 @@ class Simulation:
             y = random.randint(0, Config.GRID_SIZE - 1)
             if (x, y) not in self.obstacles and (x, y) not in self.resources and not any(c.position == (x, y) for c in self.population):
                 return (x, y)
-
-    # def run_wave(self):
-    #     self.wave += 1
-    #     self.revolution = 0
-    #     self.events.append(f"--- Wave {self.wave} ---")
-    #     for _ in range(Config.REVOLUTIONS_PER_WAVE):
-    #         self.revolution += 1
-    #         self.run_revolution()
-    #         # Pause between revolutions if needed
-    #         if self.gui and self.gui.paused:
-    #             break  # Break out to wait for unpause
-    #     self.cull_population()
-    #     self.reproduce_population()
-    #     self.age_population()
-    #     # Update environmental factors occasionally
-    #     if self.wave % 10 == 0:
-    #         self.environmental_factors = self.generate_environmental_factors()
-    #     # Update stats for GUI
-    #     self.update_stats()
-
-    # def run_revolution(self):
-    #     # Clear events for this revolution
-    #     self.events.append(f"Revolution {self.revolution} in Wave {self.wave}")
-    #     # Update grid with current positions
-    #     self.update_grid()
-    #     for creature in self.population:
-    #         if creature.alive:
-    #             creature.act(self)
-    #     # Remove dead creatures from grid
-    #     self.update_grid()
+            
+    def find_adjacent_free_cell(self, position):
+        x, y = position
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                nx = (x + dx) % Config.GRID_SIZE
+                ny = (y + dy) % Config.GRID_SIZE
+                if self.is_cell_free(nx, ny):
+                    return (nx, ny)
+        return None
 
     def run_wave(self):
         # Prepare for a new wave
@@ -415,23 +463,34 @@ class Simulation:
         self.events.append(f"--- Wave {self.wave} ---")
         if self.wave % 10 == 0:
             self.environmental_factors = self.generate_environmental_factors()
+            labelled_factors = "\n".join(f"{k}: {v:.2f}" for k, v in self.environmental_factors.items())
+            self.events.append("Environmental factors have changed: \n" + labelled_factors)
 
     def run_revolution(self):
         self.revolution += 1
         self.events.append(f"Revolution {self.revolution} in Wave {self.wave}")
-        # Update grid with current positions
-        self.update_grid()
-        for creature in self.population:
-            if creature.alive:
-                creature.act(self)
-        # Remove dead creatures from grid
-        self.update_grid()
         self.total_revolutions += 1
         self.update_stats()
-        
+        # Process each creature individually and update the grid after each
+        for creature in self.population:
+            if creature.alive:
+                creature.act()
+                self.update_grid()
+        # Remove consumed resources
+        self.resources = {pos: res for pos, res in self.resources.items() if not res.get('consumed', False)}
+        # Add new offspring to the population
+        if self.new_offspring:
+            self.population.extend(self.new_offspring)
+            self.new_offspring = []
+        # Update grid after adding offspring
+        self.update_grid()
+
     def is_wave_complete(self):
         return self.revolution >= Config.REVOLUTIONS_PER_WAVE
 
+    def add_to_graveyard(self, creature: Creature):
+        self.graveyard.append(creature)
+        
     def is_simulation_complete(self):
         return self.wave >= Config.NUM_WAVES or len(self.population) == 0
         
@@ -439,8 +498,8 @@ class Simulation:
         self.grid = [[None for _ in range(Config.GRID_SIZE)] for _ in range(Config.GRID_SIZE)]
         for x, y in self.obstacles:
             self.grid[y][x] = 'obstacle'
-        for (x, y), res_type in self.resources.items():
-            self.grid[y][x] = res_type
+        for (x, y), res in self.resources.items():
+            self.grid[y][x] = res['type']
         for creature in self.population:
             if creature.alive:
                 x, y = creature.position
@@ -470,6 +529,7 @@ class Simulation:
         if not self.population:
             self.events.append("All creatures have died.")
             return
+
         # Calculate average fitness
         avg_fitness = sum(creature.fitness for creature in self.population) / len(self.population)
         fitness_threshold = avg_fitness * 0.5  # Threshold is 50% of average fitness
@@ -478,76 +538,21 @@ class Simulation:
         temp_factor = self.environmental_factors['temperature']
         fitness_threshold *= (1 + (temp_factor - 0.5) * 0.2)  # Adjust based on temperature
 
+        # Disease adjustments to fitness threshold
+        disease_factor = self.environmental_factors['disease']
+        fitness_threshold *= (1 - disease_factor * 0.2)  # Adjust based on disease prevalence
+
         # Cull creatures below fitness threshold
         initial_population = len(self.population)
-        self.population = [
-            creature for creature in self.population if creature.fitness >= fitness_threshold
-        ]
+        survivors = []
+        for creature in self.population:
+            if not creature.is_culled(fitness_threshold):
+                survivors.append(creature)
+
+        self.population = survivors
         culled = initial_population - len(self.population)
         self.events.append(f"Culled {culled} creatures due to low fitness.")
-
-    def reproduce_population(self):
-        offspring = []
-        while len(self.population) + len(offspring) < self.population_size:
-            parent1, parent2 = self.select_mates()
-            child_chromosomes = self.reproduce(parent1, parent2)
-            child_position = self.random_free_position()
-            child = Creature(chromosomes=child_chromosomes, position=child_position)
-            offspring.append(child)
-        self.population.extend(offspring)
-        self.events.append(f"Reproduced {len(offspring)} offspring.")
-
-    def select_mates(self):
-        # Mate selection based on fertility and compatibility
-        eligible_parents = [creature for creature in self.population if creature.traits['fertility'] > 0.5]
-        if len(eligible_parents) >= 2:
-            parent1 = random.choice(eligible_parents)
-            # Select mate based on compatibility (similar traits)
-            compatibilities = [
-                (self.calculate_compatibility(parent1, creature), creature)
-                for creature in eligible_parents if creature != parent1
-            ]
-            compatibilities.sort(reverse=True)
-            parent2 = compatibilities[0][1]  # Most compatible mate
-            return parent1, parent2
-        else:
-            # If not enough eligible parents, pick randomly
-            return random.sample(self.population, 2)
-
-    def calculate_compatibility(self, creature1, creature2):
-        # Compatibility based on similarity of key traits
-        key_traits = ['social_behavior', 'adaptability', 'stress_tolerance']
-        compatibility = sum(
-            1 - abs(creature1.traits[trait] - creature2.traits[trait])
-            for trait in key_traits
-        ) / len(key_traits)
-        return compatibility
-
-    def reproduce(self, parent1, parent2):
-        # Sexual reproduction with crossover and mutation
-        child_chromosomes = []
-        for i in range(Config.NUM_CHROMOSOMES):
-            chromosome1 = parent1.chromosomes[i]
-            chromosome2 = parent2.chromosomes[i]
-            # Crossover point
-            crossover_point = random.randint(1, Config.GENES_PER_CHROMOSOME - 1)
-            child_chromosome = {}
-            # Combine genes from both parents
-            gene_keys = list(chromosome1.keys())
-            for j in range(Config.GENES_PER_CHROMOSOME):
-                gene = gene_keys[j]
-                if j < crossover_point:
-                    gene_value = chromosome1[gene]
-                else:
-                    gene_value = chromosome2[gene]
-                # Mutation
-                if random.random() < Config.MUTATION_RATE:
-                    gene_value += random.uniform(-0.1, 0.1)
-                    gene_value = max(min(gene_value, 1), 0)
-                child_chromosome[gene] = gene_value
-            child_chromosomes.append(child_chromosome)
-        return child_chromosomes
-
+        
     def age_population(self):
         # Age creatures and remove those that die of old age or starvation
         survivors = []
@@ -574,7 +579,7 @@ class Simulation:
             self.average_fitness = 0
 
     def set_gui(self, gui):
-        self.gui = gui
+        self.gui: SimulationGUI = gui
 
 class SimulationGUI:
     def __init__(self):
@@ -582,6 +587,7 @@ class SimulationGUI:
         self.root = tk.Tk()
         self.root.title("Evolution Simulator")
         self.paused = False
+        self.selected_creature = None  # Add this line
         self.create_configuration_interface()
 
     def create_configuration_interface(self):
@@ -619,7 +625,7 @@ class SimulationGUI:
         label.pack(side=tk.LEFT)
         entry = tk.Entry(frame, textvariable=variable)
         entry.pack(side=tk.RIGHT, expand=True, fill=tk.X)
-
+    
     def start_simulation(self):
         # Update configuration with user inputs
         Config.POPULATION_SIZE = self.population_size_var.get()
@@ -632,10 +638,7 @@ class SimulationGUI:
         Config.OBSTACLES_PERCENTAGE = self.obstacles_percentage_var.get()
         Config.RESOURCES_PERCENTAGE = self.resources_percentage_var.get()
         Config.TOTAL_GENES = Config.NUM_CHROMOSOMES * Config.GENES_PER_CHROMOSOME
-
-        # Regenerate gene names and traits
-        self.generate_gene_names_and_traits()
-
+        
         # Hide configuration interface
         self.config_frame.destroy()
         self.start_button.destroy()
@@ -647,21 +650,30 @@ class SimulationGUI:
         self.simulation = simulation
         self.canvas_size = 600
 
-        # Create main GUI frames
-        self.main_frame = tk.Frame(self.root)
-        self.main_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Create main GUI frames using notebook tabs
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        self.stats_frame = tk.Frame(self.root)
-        self.stats_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        # Simulation Tab
+        self.simulation_frame = tk.Frame(self.notebook)
+        self.notebook.add(self.simulation_frame, text="Simulation")
 
-        # Create canvas for the grid
-        self.canvas = tk.Canvas(self.main_frame, width=self.canvas_size, height=self.canvas_size)
-        self.canvas.pack()
+        # Graveyard Tab
+        self.graveyard_frame = tk.Frame(self.notebook)
+        self.notebook.add(self.graveyard_frame, text="Graveyard")
 
-        # Bind mouse events for mouseover functionality
+        # Create canvas for the grid in simulation tab
+        self.canvas = tk.Canvas(self.simulation_frame, width=self.canvas_size, height=self.canvas_size)
+        self.canvas.pack(side=tk.LEFT)
+
+        # Bind mouse events for mouseover and click functionality
         self.canvas.bind("<Motion>", self.on_mouse_move)
+        self.canvas.bind("<Button-1>", self.on_mouse_click)  # Bind left-click event
 
         # Create stats display
+        self.stats_frame = tk.Frame(self.simulation_frame)
+        self.stats_frame.pack(side=tk.RIGHT, fill=tk.Y)
+
         self.stats_label = tk.Label(self.stats_frame, text="Simulation Stats", font=("Helvetica", 14))
         self.stats_label.pack(pady=10)
         self.population_label = tk.Label(self.stats_frame, text="")
@@ -672,8 +684,13 @@ class SimulationGUI:
         self.wave_label.pack()
         self.revolution_label = tk.Label(self.stats_frame, text="")
         self.revolution_label.pack()
+
         self.creature_info_label = tk.Label(self.stats_frame, text="", justify=tk.LEFT)
-        self.creature_info_label.pack(pady=20)
+        self.creature_info_label.pack(pady=10)
+
+        # Add label for selected creature information
+        self.selected_creature_info_label = tk.Label(self.stats_frame, text="", justify=tk.LEFT, fg="blue")
+        self.selected_creature_info_label.pack(pady=10)
 
         # Create pause/play buttons
         self.button_frame = tk.Frame(self.stats_frame)
@@ -682,6 +699,8 @@ class SimulationGUI:
         self.pause_button.pack(side=tk.LEFT, padx=5)
         self.play_button = tk.Button(self.button_frame, text="Play", command=self.play_simulation)
         self.play_button.pack(side=tk.LEFT, padx=5)
+        self.restart_button = tk.Button(self.button_frame, text="Restart", command=self.restart_simulation)
+        self.restart_button.pack(side=tk.LEFT, padx=5)
 
         # Create event log window
         self.event_log_window = tk.Toplevel(self.root)
@@ -689,38 +708,27 @@ class SimulationGUI:
         self.event_log_text = tk.Text(self.event_log_window, state='disabled', width=60, height=20)
         self.event_log_text.pack()
 
+        # Graveyard Listbox in the graveyard tab
+        self.graveyard_listbox = tk.Listbox(self.graveyard_frame, width=80)
+        self.graveyard_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Scrollbar for the graveyard listbox
+        self.graveyard_scrollbar = tk.Scrollbar(self.graveyard_frame)
+        self.graveyard_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.graveyard_listbox.config(yscrollcommand=self.graveyard_scrollbar.set)
+        self.graveyard_scrollbar.config(command=self.graveyard_listbox.yview)
+
         self.draw_population()
-        self.root.after(1000, self.run_simulation)
+        self.root.after(1000, self.run_simulation)  # Start simulation after 1 second
 
-    def generate_gene_names_and_traits(self):
-        global gene_names, traits_list, gene_trait_mapping, trait_weights
-        gene_names = [f'gene{i+1}' for i in range(Config.TOTAL_GENES)]
-        # Define traits
-        traits_list = [
-            'strength', 'speed', 'intelligence', 'endurance', 'aggression',
-            'vision', 'camouflage', 'fertility', 'longevity', 'temperature_resistance',
-            'hearing', 'immunity', 'metabolism', 'reproductive_rate', 'disease_resistance',
-            'water_conservation', 'night_vision', 'social_behavior', 'adaptability', 'stress_tolerance'
-        ]
-        # Ensure we have enough genes to affect traits
-        if Config.TOTAL_GENES < len(traits_list):
-            print("Not enough genes to cover all traits")
-            self.root.destroy()
-            return
-        # Map genes to traits
-        gene_trait_mapping = {}
-        for gene in gene_names:
-            # Each gene affects 1 to 3 traits
-            num_traits = random.randint(1, 3)
-            affected_traits = random.sample(traits_list, num_traits)
-            gene_trait_mapping[gene] = {}
-            for trait in affected_traits:
-                # Assign a random weight between -1 and 1
-                weight = random.uniform(-1, 1)
-                gene_trait_mapping[gene][trait] = weight
-        # Trait weights for fitness calculation
-        trait_weights = {trait: random.uniform(0.5, 1.5) for trait in traits_list}
-
+    def restart_simulation(self):
+        # Reset the simulation and GUI
+        self.simulation = None
+        self.selected_creature = None
+        self.paused = False
+        self.notebook.destroy()
+        self.create_configuration_interface()
+    
     def draw_population(self):
         self.canvas.delete("all")
         cell_size = self.canvas_size // Config.GRID_SIZE
@@ -735,9 +743,10 @@ class SimulationGUI:
                 if (x, y) in self.simulation.obstacles:
                     self.canvas.create_rectangle(x0, y0, x1, y1, fill='gray', outline="")
                 elif (x, y) in self.simulation.resources:
-                    res_type = self.simulation.resources[(x, y)]
-                    color = 'yellow' if res_type == 'food' else 'blue'
+                    resource = self.simulation.resources[(x, y)]
+                    color = 'yellow' if resource["type"] == 'food' else 'blue'
                     self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
+                    
         # Draw creatures
         for creature in self.simulation.population:
             if creature.alive:
@@ -746,10 +755,55 @@ class SimulationGUI:
                 y0 = y * cell_size
                 x1 = x0 + cell_size
                 y1 = y0 + cell_size
-                self.canvas.create_rectangle(x0, y0, x1, y1, fill=creature.color, outline="")
+                if creature == self.selected_creature:
+                    outline_color = 'red'
+                    outline_width = 2
+                else:
+                    outline_color = ''
+                    outline_width = 0
+                self.canvas.create_rectangle(
+                    x0, y0, x1, y1, fill=creature.color, outline=outline_color, width=outline_width
+                )
+                
         # Update stats and event log
         self.update_stats_display()
         self.update_event_log()
+        self.update_selected_creature_info()  # Update selected creature info
+
+    def on_mouse_click(self, event):
+        # Calculate grid position from mouse coordinates
+        cell_size = self.canvas_size // Config.GRID_SIZE
+        x = event.x // cell_size
+        y = event.y // cell_size
+        x = min(max(x, 0), Config.GRID_SIZE - 1)
+        y = min(max(y, 0), Config.GRID_SIZE - 1)
+        # Check if a creature is at this position
+        for c in self.simulation.population:
+            if c.alive and c.position == (x, y):
+                self.selected_creature = c
+                # Update selected creature info label
+                self.update_selected_creature_info()
+                break
+        else:
+            self.selected_creature = None
+            self.selected_creature_info_label.config(text="")
+        # Redraw the population to show the selection
+        self.draw_population()
+
+    def update_selected_creature_info(self):
+        c = self.selected_creature
+        if c and c.alive:
+            info = f"Selected Creature at ({c.position[0]}, {c.position[1]}):\n"
+            info += f"Current Thought: {c.current_thought}\n"
+            for trait, value in c.traits.items():
+                info += f"{trait.capitalize()}: {value:.2f}\n"
+            info += f"Hunger: {c.hunger}\n"
+            info += f"Thirst: {c.thirst}\n"
+            info += f"Age: {c.age}\n"
+            self.selected_creature_info_label.config(text=info)
+        else:
+            self.selected_creature_info_label.config(text="Selected creature is no longer alive.")
+            self.selected_creature = None
 
     def on_mouse_move(self, event):
         # Calculate grid position from mouse coordinates
@@ -764,6 +818,7 @@ class SimulationGUI:
             if c.alive and c.position == (x, y):
                 # Creature info
                 info += f"Creature at ({x}, {y}):\n"
+                info += f"Current Thought: {c.current_thought}\n"
                 for trait, value in c.traits.items():
                     info += f"{trait.capitalize()}: {value:.2f}\n"
                 info += f"Hunger: {c.hunger}\n"
@@ -772,8 +827,8 @@ class SimulationGUI:
                 break
         else:
             if (x, y) in self.simulation.resources:
-                res_type = self.simulation.resources[(x, y)]
-                info += f"Resource at ({x}, {y}): {res_type.capitalize()}\n"
+                resource = self.simulation.resources[(x, y)]
+                info += f'Resource at ({x}, {y}): {resource["type"].capitalize()}\n'
             elif (x, y) in self.simulation.obstacles:
                 info += f"Obstacle at ({x}, {y})\n"
             else:
@@ -784,27 +839,33 @@ class SimulationGUI:
         if not self.paused and self.simulation:
             if self.simulation.is_wave_complete():
                 # End-of-wave processing
-                self.simulation.cull_population()
-                self.simulation.reproduce_population()
                 self.simulation.age_population()
+                self.simulation.cull_population()
                 if self.simulation.is_simulation_complete():
                     print("Simulation ended.")
-                    self.root.destroy()
+                    self.paused = True  # Pause the simulation
+                    # Update the graveyard tab
+                    self.update_graveyard()
                     return
                 else:
                     self.simulation.run_wave()
             else:
                 self.simulation.run_revolution()
                 self.draw_population()
-            if self.simulation.is_simulation_complete():
-                print("Simulation ended.")
-                self.root.destroy()
-            else:
-                self.root.after(500, self.run_simulation)
+        if self.simulation and self.simulation.is_simulation_complete():
+            print("Simulation ended.")
+            self.paused = True
+            self.update_graveyard()
         else:
-            # Check again after some time if paused
-            self.root.after(500, self.run_simulation)
+            self.root.after(500, self.run_simulation)  # Schedule the next simulation step
 
+    def update_graveyard(self):
+        # Clear the graveyard listbox
+        self.graveyard_listbox.delete(0, tk.END)
+        for idx, creature in enumerate(self.simulation.graveyard, 1):
+            info = f"{idx}. Age: {creature.age}, Cause of Death: {creature.cause_of_death}, Traits: "
+            traits_info = ', '.join(f"{trait}: {value:.2f}" for trait, value in creature.traits.items())
+            self.graveyard_listbox.insert(tk.END, info + traits_info)
 
     def pause_simulation(self):
         self.paused = True
