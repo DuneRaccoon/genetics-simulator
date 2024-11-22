@@ -180,10 +180,24 @@ class Creature:
                 return
 
         # General movement
-        self.move(simulation, intelligence)
+        self.move(intelligence, vision_range)
 
-    def find_resource(self, simulation, resource_type, vision_range):
-        # Find the nearest resource of the given type within vision range
+    def scan_surroundings(self):
+        # Update known resources based on current vision
+        self.known_resources = {}
+        vision_range = int(self.traits['vision'] * 5) + 1
+        x0, y0 = self.position
+        for dx in range(-vision_range, vision_range + 1):
+            for dy in range(-vision_range, vision_range + 1):
+                x = (x0 + dx) % Config.GRID_SIZE
+                y = (y0 + dy) % Config.GRID_SIZE
+                if (x, y) in self.simulation.resources:
+                    resource = self.simulation.resources[(x, y)]
+                    if not resource.get('claimed', False):
+                        self.known_resources[(x, y)] = resource
+
+    def find_resource(self, resource_type):
+        # Find the nearest known resource of the given type
         min_distance = None
         target = None
         x0, y0 = self.position
@@ -276,44 +290,176 @@ class Creature:
         else:
             # Can't find path, stay in place
             pass
+        
+    def calculate_compatibility(self, creature2: Creature):
+        # Compatibility based on similarity of key traits
+        key_traits = ['social_behavior', 'adaptability', 'stress_tolerance']
+        compatibility = sum(
+            1 - abs(self.traits[trait] - creature2.traits[trait])
+            for trait in key_traits
+        ) / len(key_traits)
+        return compatibility
+    
+    def reproduce(self, parent2: Creature):
+        # Sexual reproduction with crossover and mutation
+        child_chromosomes = []
+        for i in range(Config.NUM_CHROMOSOMES):
+            chromosome1 = self.chromosomes[i]
+            chromosome2 = parent2.chromosomes[i]
+            # Crossover point
+            crossover_point = random.randint(1, Config.GENES_PER_CHROMOSOME - 1)
+            child_chromosome = {}
+            # Combine genes from both parents
+            gene_keys = list(chromosome1.keys())
+            for j in range(Config.GENES_PER_CHROMOSOME):
+                gene = gene_keys[j]
+                if j < crossover_point:
+                    gene_value = chromosome1[gene]
+                else:
+                    gene_value = chromosome2[gene]
+                # Mutation
+                if random.random() < Config.MUTATION_RATE:
+                    gene_value += random.uniform(-0.1, 0.1)
+                    gene_value = max(min(gene_value, 1), 0)
+                child_chromosome[gene] = gene_value
+            child_chromosomes.append(child_chromosome)
+        return child_chromosomes
 
-    def move(self, simulation, intelligence):
-        # General movement based on intelligence
+    def attempt_reproduction(self, mate: Creature):
+        # Check if mate is adjacent
+        x0, y0 = self.position
+        x1, y1 = mate.position
+        if abs(x0 - x1) <= 1 and abs(y0 - y1) <= 1:
+            if self.calculate_compatibility(mate) > 0.4:
+                # Reproduce
+                child_chromosomes = self.reproduce(self, mate)
+                child_position = self.simulation.find_adjacent_free_cell(self.position)
+                if child_position:
+                    child = Creature(self.simulation, chromosomes=child_chromosomes, position=child_position)
+                    self.simulation.new_offspring.append(child)
+                    self.simulation.events.append(f"Creatures at {self.position} and {mate.position} reproduced.")
+                    self.reproduction_counter += 1
+                    mate.reproduction_counter += 1
+                    # Set reproduction cooldown
+                    cooldown_time = Config.REVOLUTIONS_PER_WAVE
+                    self.reproduction_cooldown = cooldown_time
+                    mate.reproduction_cooldown = cooldown_time
+                    # Reset mate target
+                    self.mate = None
+                    mate.mate = None
+                else:
+                    # No space to place offspring
+                    self.simulation.events.append(f"No space to place offspring for parents at {self.position} and {mate.position}.")
+            else:
+                # Incompatible mate
+                self.simulation.events.append(f"Creatures at {self.position} and {mate.position} incompatible for reproduction.")
+
+    def move(self, intelligence, vision_range):
+        # Enhanced general movement based on intelligence and vision
         if intelligence > 0.7:
-            # High intelligence: Move towards a goal (e.g., center of the grid)
-            goal = (Config.GRID_SIZE // 2, Config.GRID_SIZE // 2)
-            path = self.a_star_pathfinding(simulation, goal)
-            if path:
-                self.position = path[0]
+            self.current_thought = "I'm highly intelligent, analyzing surroundings."
+            # High intelligence: Analyze surroundings and choose best path
+            target = self.find_best_tile(vision_range)
+            if target:
+                path = self.a_star_pathfinding(target)
+                if path:
+                    self.position = path[0]
+                else:
+                    self.position = self.random_adjacent_position()
+            else:
+                self.position = self.random_adjacent_position()
         elif intelligence > 0.4:
-            # Medium intelligence: Greedy movement towards goal
-            goal = (Config.GRID_SIZE // 2, Config.GRID_SIZE // 2)
-            path = self.greedy_move(simulation, goal)
-            if path:
-                self.position = path[0]
+            self.current_thought = "I'm moderately intelligent, moving towards resources or fewer creatures."
+            # Medium intelligence: Move towards tile with resources or fewer creatures
+            target = self.find_best_tile(vision_range)
+            if target:
+                path = self.greedy_move(target)
+                if path:
+                    self.position = path[0]
+                else:
+                    self.position = self.random_adjacent_position()
+            else:
+                self.position = self.random_adjacent_position()
         else:
             # Low intelligence: Random movement
-            self.position = self.random_adjacent_position(simulation)
+            self.current_thought = "I'm not very intelligent, moving randomly."
+            self.position = self.random_adjacent_position()
 
-    def attack(self, target, simulation):
+    def find_best_tile(self, vision_range):
+        # Analyze surroundings to find the best tile to move towards
+        best_score = -float('inf')
+        best_tile = None
+        x0, y0 = self.position
+        for dx in range(-vision_range, vision_range + 1):
+            for dy in range(-vision_range, vision_range + 1):
+                x = (x0 + dx) % Config.GRID_SIZE
+                y = (y0 + dy) % Config.GRID_SIZE
+                if (x, y) == (x0, y0):
+                    continue
+                # Evaluate tile
+                score = self.evaluate_tile(x, y)
+                if score > best_score:
+                    best_score = score
+                    best_tile = (x, y)
+        return best_tile
+
+    def evaluate_tile(self, x, y):
+        # Assign a score to the tile based on certain criteria
+        score = 0
+        cell = self.simulation.grid[y][x]
+        if cell is None:
+            score += 1  # Prefer empty cells
+        elif cell in ['food', 'water']:
+            score += 5  # Prefer resource tiles
+        elif isinstance(cell, Creature):
+            # Avoid tiles with other creatures unless aggressive
+            if self.traits['aggression'] > 0.7:
+                score += 2  # May want to attack
+            else:
+                score -= 5  # Avoid confrontation
+        if (x, y) in self.simulation.obstacles:
+            score -= 10  # Avoid obstacles
+        return score
+
+    def attack(self, target):
         # Simple attack logic
         attack_power = self.traits['aggression'] * self.traits['strength']
         defense_power = target.traits['endurance'] * target.traits['camouflage']
         if attack_power > defense_power:
             target.alive = False  # Target dies
-            simulation.events.append(f"Creature at {self.position} killed creature at {target.position}")
+            target.cause_of_death = f"Killed by creature at {self.position}"
+            self.simulation.events.append(f"Creature at {self.position} killed creature at {target.position}")
+            self.simulation.add_to_graveyard(target)
+            # Consume the creature as food
+            self.consume_creature(target)
         else:
             self.simulation.events.append(f"Creature at {self.position} failed to kill creature at {target.position}")
 
-    def consume_resource(self, simulation, position):
-        resource_type = simulation.resources.pop(position)
-        if resource_type == 'food':
-            self.hunger = max(self.hunger - 50, 0)
-        elif resource_type == 'water':
-            self.thirst = max(self.thirst - 50, 0)
-        simulation.events.append(f"Creature at {self.position} consumed {resource_type}")
+    def consume_resource(self, position):
+        resource = self.simulation.resources.get(position)
+        if resource and not resource.get('consumed', False):
+            resource_type = resource['type']
+            resource['consumed'] = True  # Mark resource as consumed
+            if resource_type == 'food':
+                self.hunger = max(self.hunger - 50, 0)
+            elif resource_type == 'water':
+                self.thirst = max(self.thirst - 50, 0)
+            self.simulation.events.append(f"Creature at {self.position} consumed {resource_type}")
+            self.target_resource = None
+            # Remove resource from simulation and update GUI
+            del self.simulation.resources[position]
+            if self.simulation.gui:
+                self.simulation.gui.draw_population()
+        else:
+            # Resource no longer available
+            self.target_resource = None
 
-    def random_adjacent_position(self, simulation):
+    def consume_creature(self, target):
+        # Consuming the defeated creature reduces hunger significantly
+        self.hunger = max(self.hunger - 70, 0)
+        self.simulation.events.append(f"Creature at {self.position} consumed creature at {target.position}")
+
+    def random_adjacent_position(self):
         x, y = self.position
         adjacent_positions = self.simulation.get_adjacent_positions(x, y)
         if adjacent_positions:
@@ -388,13 +534,59 @@ class Simulation:
         self.environmental_factors = self.generate_environmental_factors()
         self.grid = self.create_grid()
         self.obstacles = set()
-        self.resources = {}
-        self.events = []  # List to store events
+        self.resources: Dict[Tuple[int, int], Dict[str, Union[str, bool]]] = {}  # {(x, y): {'type': 'food', 'claimed': False}}
+        self.events: List[str] = []
+        self.total_revolutions: int = 0
+        self.gui: SimulationGUI = None  # Reference to GUI
+        self.graveyard: List[Creature] = []  # List to store dead creatures
+
         self.place_obstacles()
         self.place_resources()
-        self.create_population()
-        self.total_revolutions = 0  # Total number of revolutions run
+        
+        # diversify gene and trait mapping
+        for _ in split(self.population_size, 5):
+            self.generate_gene_names_and_traits()
+            self.create_population()
 
+        self.update_stats()
+    
+    @staticmethod
+    def _show_constants():
+        return gene_names, traits_list, gene_trait_mapping, trait_weights
+    
+    def generate_gene_names_and_traits(self):
+        global gene_names, traits_list, gene_trait_mapping, trait_weights
+
+        gene_names = [f'gene{i + 1}' for i in range(Config.TOTAL_GENES)]
+
+        # Define traits
+        traits_list = [
+            'strength', 'speed', 'intelligence', 'endurance', 'aggression',
+            'vision', 'camouflage', 'fertility', 'longevity', 'temperature_resistance',
+            'hearing', 'immunity', 'metabolism', 'reproductive_rate', 'disease_resistance',
+            'water_conservation', 'night_vision', 'social_behavior', 'adaptability', 'stress_tolerance'
+        ]
+
+        # Ensure we have enough genes to affect traits
+        if Config.TOTAL_GENES < len(traits_list):
+            print("Not enough genes to cover all traits")
+            raise Exception("Insufficient genes")
+
+        # Map genes to traits
+        gene_trait_mapping = {}
+        for gene in gene_names:
+            # Each gene affects 1 to 3 traits
+            num_traits = random.randint(1, 3)
+            affected_traits = random.sample(traits_list, num_traits)
+            gene_trait_mapping[gene] = {}
+            for trait in affected_traits:
+                # Assign a random weight between -1 and 1
+                weight = random.uniform(-1, 1)
+                gene_trait_mapping[gene][trait] = weight
+
+        # Trait weights for fitness calculation
+        trait_weights = {trait: random.uniform(0.5, 1.5) for trait in traits_list}
+        
     def generate_environmental_factors(self):
         # Environmental factors can affect the fitness calculation
         factors = {
