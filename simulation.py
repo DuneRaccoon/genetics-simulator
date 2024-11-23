@@ -15,6 +15,8 @@ traits_list = []  # e.g. ['strength', 'speed', 'intelligence', ...]
 gene_trait_mapping = {}  # e.g. {'gene1': {'strength': 0.5, 'speed': -0.3}, ...}
 trait_weights = {}  # e.g. {'strength': 1.2, 'speed': 0.8, ...}
 
+MAX_MEMORY_CAPACITIY = 20
+MIN_MEMORY_CAPACITIY = 3
 
 def split(x, y):
     return [x // y + (1 if x % y > i else 0) for i in range(y)]
@@ -53,6 +55,9 @@ class Creature:
         self.thoughts = []  # Log of actions and thoughts
         self.cause_of_death = ""
         self.target_resource = None  # Current target resource
+        
+        self.memory_resources: Dict[Tuple[int, int], Dict[str, any]] = {}
+        self.memory_creatures: Dict[Tuple[int, int], Dict[str, any]] = {}
 
         # For females, initialize reproductive cycle
         if self.sex == 'female':
@@ -64,6 +69,11 @@ class Creature:
     def vision_range(self):
         # Scale vision range based on vision trait, between 1 and 6 cells around self
         return int(self.traits['vision'] * 5) + 1
+    
+    @property
+    def memory_capacity(self):
+        # Scale memory capacity based on intelligence trait
+        return int(self.traits['intelligence'] * (MAX_MEMORY_CAPACITIY - MIN_MEMORY_CAPACITIY)) + MIN_MEMORY_CAPACITIY
     
     def generate_chromosomes(self):
         # Each gene is a continuous value between 0 and 1
@@ -161,10 +171,7 @@ class Creature:
         self.current_thought = thought
         self.thoughts.append(thought)
         
-        # Scale thought capacity based on intelligence
-        thought_capacity = int(self.traits['intelligence'] * 10) + 1
-        
-        if len(self.thoughts) > thought_capacity:
+        if len(self.thoughts) > self.memory_capacity:
             # Forget old thoughts
             self.thoughts.pop(0)
 
@@ -260,9 +267,16 @@ class Creature:
                 self.move_towards_target(target)
                 return
             else:
-                self.have_thought(f"Searching for {resource_type}")
-                self.move()
-                return
+                 # Use memory to find resources
+                memory_target = self.find_resource_in_memory(resource_type)
+                if memory_target:
+                    self.have_thought(f"Recalling location of {resource_type} from memory")
+                    self.move_towards_target(memory_target)
+                    return
+                else:
+                    self.have_thought(f"Searching for {resource_type}")
+                    self.move()
+                    return
             
         # Adjust reproduction behavior based on sex and cycle
         if self.sex == 'female':
@@ -288,6 +302,14 @@ class Creature:
                 self.move_towards_target(mate.position, mate_target=mate)
                 self.have_thought(f"Seeking mate at {mate.position}")
                 return
+            else:
+                # Use memory to find mates
+                memory_mate = self.find_mate_in_memory()
+                if memory_mate:
+                    self.mate = memory_mate
+                    self.move_towards_target(memory_mate['position'], mate_target=None)
+                    self.have_thought(f"Recalling mate from memory at {memory_mate['position']}")
+                    return
 
         # High aggression creatures seek targets
         if self.traits['aggression'] > 0.7:
@@ -296,9 +318,106 @@ class Creature:
                 self.move_towards_target(target.position, attack_target=target)
                 self.have_thought(f"Attacking creature at {target.position}")
                 return
+            else:
+                # Use memory to find targets
+                memory_target = self.find_target_in_memory()
+                if memory_target:
+                    self.move_towards_target(memory_target['position'], attack_target=None)
+                    self.have_thought(f"Recalling target from memory at {memory_target['position']}")
+                    return
 
         # General movement
         self.move()
+        
+    def find_resource_in_memory(self, resource_type):
+        # Find the nearest remembered resource of the given type
+        min_distance = None
+        target = None
+        x0, y0 = self.position
+        current_time = self.simulation.total_revolutions
+
+        # Clean up outdated memories (optional)
+        self.cleanup_memory_resources()
+
+        for (x1, y1), res in self.memory_resources.items():
+            if res['type'] == resource_type:
+                distance = abs(x1 - x0) + abs(y1 - y0)
+                if min_distance is None or distance < min_distance:
+                    min_distance = distance
+                    target = (x1, y1)
+        return target
+
+    def find_mate_in_memory(self):
+        # Find a remembered potential mate
+        min_distance = None
+        potential_mate = None
+        x0, y0 = self.position
+
+        # Clean up outdated memories (optional)
+        self.cleanup_memory_creatures()
+
+        for (x1, y1), creature_info in self.memory_creatures.items():
+            if self.sex != creature_info['sex']:
+                # Additional mate suitability checks can be added here
+                distance = abs(x1 - x0) + abs(y1 - y0)
+                if min_distance is None or distance < min_distance:
+                    min_distance = distance
+                    potential_mate = creature_info
+        return potential_mate
+    
+    def find_target_in_memory(self):
+        # Find a remembered target creature
+        min_distance = None
+        target = None
+        x0, y0 = self.position
+
+        # Clean up outdated memories (optional)
+        self.cleanup_memory_creatures()
+
+        for (x1, y1), creature_info in self.memory_creatures.items():
+            distance = abs(x1 - x0) + abs(y1 - y0)
+            if min_distance is None or distance < min_distance:
+                min_distance = distance
+                target = creature_info
+        return target
+    
+    def cleanup_memory_resources(self):
+        # Optionally remove resources that are likely consumed or outdated
+        # For example, remove memories older than a certain number of revolutions
+        
+        for position, resource in list(self.memory_resources.items()):
+            if resource.get('consumed', False):
+                self.memory_resources.pop(position)
+            elif resource.get('last_seen', 0) < self.simulation.total_revolutions - 10:
+                self.memory_resources.pop(position)
+
+    def cleanup_memory_creatures(self):
+        # Optionally remove creature memories that are outdated
+        for position, creature_info in list(self.memory_creatures.items()):
+            if creature_info.get('last_seen', 0) < self.simulation.total_revolutions - 10:
+                self.memory_creatures.pop(position)
+                
+    def decay_memory(self):
+        # Reduce the strength of memories over time or remove old ones
+        # For simplicity, we'll remove memories older than a certain threshold
+        memory_lifespan = int(self.traits['intelligence'] * 50)  # Adjust as needed
+        current_time = self.simulation.total_revolutions
+
+        # Remove old resource memories
+        to_remove = []
+        for position, resource in self.memory_resources.items():
+            if current_time - resource.get('last_seen', current_time) > memory_lifespan:
+                to_remove.append(position)
+        for position in to_remove:
+            del self.memory_resources[position]
+
+        # Remove old creature memories
+        to_remove = []
+        for position, creature_info in self.memory_creatures.items():
+            if current_time - creature_info.get('last_seen', current_time) > memory_lifespan:
+                to_remove.append(position)
+        for position in to_remove:
+            del self.memory_creatures[position]
 
     def rest(self):
         # Regain some energy while resting
@@ -326,15 +445,62 @@ class Creature:
         """
         vision_range = self.vision_range
         x0, y0 = self.position
+
+        # List to collect observed resources and creatures
+        observed_resources = []
+        observed_creatures = []
+
         for dx in range(-vision_range, vision_range + 1):
             for dy in range(-vision_range, vision_range + 1):
                 x = (x0 + dx) % Config.GRID_SIZE
                 y = (y0 + dy) % Config.GRID_SIZE
+
+                # Check for resources
                 if (x, y) in self.simulation.resources:
                     resource = self.simulation.resources[(x, y)]
-                    if not resource.get('claimed', False) and not resource.get('consumed', False):
-                        self.known_resources[(x, y)] = resource
+                    if not resource.get('consumed', False):
+                        resource_info = {
+                            **resource,
+                            'position': (x, y),
+                            'last_seen': self.simulation.total_revolutions
+                        }
+                        observed_resources.append(((x, y), resource_info))
 
+                # Check for creatures
+                cell: Creature = self.simulation.grid[y][x]
+                if isinstance(cell, Creature) and cell != self and cell.alive:
+                    creature_info = {
+                        'position': (x, y),
+                        'sex': cell.sex,
+                        'traits': cell.traits.copy(),
+                        'age': cell.age,
+                        'last_seen': self.simulation.total_revolutions
+                    }
+                    observed_creatures.append(((x, y), creature_info))
+
+        # Update memory with observed resources
+        for position, resource in observed_resources:
+            self.memory_resources[position] = resource
+
+        # Update memory with observed creatures
+        for position, creature_info in observed_creatures:
+            self.memory_creatures[position] = creature_info
+
+        # Ensure memory does not exceed capacity
+        self.manage_memory_capacity()
+
+    def manage_memory_capacity(self):
+        """
+        Ensure memory does not exceed capacity by removing oldest memories.
+        """
+        while len(self.memory_resources) > self.memory_capacity:
+            # Remove the oldest memory (FIFO)
+            self.memory_resources.pop(next(iter(self.memory_resources)))
+
+        while len(self.memory_creatures) > self.memory_capacity:
+            # Remove the oldest memory
+            self.memory_creatures.pop(next(iter(self.memory_creatures)))
+            
     def find_resource(self, resource_type):
         # Find the nearest known resource of the given type
         min_distance = None
@@ -414,6 +580,23 @@ class Creature:
                 self.target_resource = None
                 return
 
+        # If moving towards a resource from memory, check if resource is still there upon arrival
+        if not attack_target and not mate_target and self.position == target_position:
+            if (self.position in self.simulation.resources) and not self.simulation.resources[self.position].get('consumed', False):
+                self.consume_resource(self.position)
+            else:
+                # Resource is not there; remove it from memory
+                if self.position in self.memory_resources:
+                    del self.memory_resources[self.position]
+                self.have_thought("Resource not found at remembered location")
+
+        # Similarly handle mates from memory
+        if mate_target is None and self.position == target_position:
+            # The mate may no longer be there; remove from memory
+            if self.position in self.memory_creatures:
+                del self.memory_creatures[self.position]
+            self.have_thought("Mate not found at remembered location")
+            
         # Determine pathfinding method based on intelligence
         if self.traits['intelligence'] > 0.8:
             # Very high intelligence: Use bidirectional A* pathfinding
@@ -1418,6 +1601,10 @@ class SimulationGUI:
             info += f"Age: {c.age}\n"
             if c.sex == 'female':
                 info += f"Cycle Day: {c.cycle_day}/{c.cycle_length}\n"
+            # Display memory capacity and current memory usage
+            info += f"Memory Capacity: {c.memory_capacity}\n"
+            info += f"Known Resources: {len(c.memory_resources)}\n"
+            info += f"Known Creatures: {len(c.memory_creatures)}\n"
             self.selected_creature_info_label.config(text=info)
         else:
             self.selected_creature_info_label.config(text="Selected creature is no longer alive.")
