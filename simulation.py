@@ -174,6 +174,13 @@ class Creature:
         if len(self.thoughts) > self.memory_capacity:
             # Forget old thoughts
             self.thoughts.pop(0)
+            
+    def die(self, cause: str):
+        self.alive = False
+        self.cause_of_death = cause
+        self.simulation.events.append(f"Creature at {self.position} died of {cause}.")
+        self.simulation.add_to_graveyard(self)
+        return True
 
     def increase_hunger_thirst(self):
         # Increase hunger and thirst
@@ -182,26 +189,13 @@ class Creature:
         thirst_increase = 5 * metabolism_rate
         self.hunger += hunger_increase
         self.thirst += thirst_increase
-
-        if self.hunger >= 100 or self.thirst >= 100:
-            self.alive = False  # Dies from starvation or dehydration
-            self.cause_of_death = "Starvation/Dehydration"
-            self.simulation.events.append(f"Creature at {self.position} died of hunger or thirst.")
-            self.simulation.add_to_graveyard(self)
-            return True
-        return False
+        return (self.hunger >= 100 or self.thirst >= 100) and self.die("Starvation/Dehydration")
 
     def age_creature(self):
         self.age += 1
         # Calculate lifespan based on longevity trait
         lifespan = int(self.traits['longevity'] * (Config.MAX_LIFESPAN - Config.MIN_LIFESPAN)) + Config.MIN_LIFESPAN
-        died = self.age >= lifespan
-        if died:
-            self.alive = False
-            self.cause_of_death = "Old Age"
-            self.simulation.events.append(f"Creature at {self.position} died of old age.")
-            self.simulation.add_to_graveyard(self)
-        return died
+        return self.age >= lifespan and self.die("Old Age")
 
     def calculate_energy_consumption(self):
         # Base energy consumption per revolution
@@ -225,14 +219,7 @@ class Creature:
 
         If the creature is culled, returns True, otherwise False.
         """
-        # Check if creature should be culled based on fitness
-        if self.fitness < fitness_threshold:
-            self.alive = False
-            self.cause_of_death = "Culled due to Low Fitness"
-            self.simulation.events.append(f"Creature at {self.position} culled due to low fitness.")
-            self.simulation.add_to_graveyard(self)
-            return True
-        return False
+        return self.fitness < fitness_threshold and self.die("Fitness below threshold")
 
     def act(self):
         # Decide action based on traits and needs
@@ -243,7 +230,7 @@ class Creature:
         time_of_day = self.simulation.get_time_of_day()
         activity_level = self.determine_activity_level(time_of_day)
 
-        if activity_level < 0.3:
+        if activity_level < 0.3 and self.energy < 25:
             # Less active during this time
             self.have_thought(f"Resting during {time_of_day}.")
             self.rest()
@@ -564,8 +551,7 @@ class Creature:
         # Check if target is still valid before moving
         if attack_target and not attack_target.alive:
             # Target is dead, abandon action
-            self.have_thought("Target is dead")
-            return
+            return self.have_thought("Target is dead")
         elif mate_target and (not mate_target.alive or mate_target.reproduction_cooldown > 0):
             # Mate is no longer available
             self.have_thought("Mate no longer available")
@@ -847,7 +833,7 @@ class Creature:
         else:
             self.simulation.events.append(f"Creature at {self.position} failed to kill creature at {target.position}")
 
-    def consume_resource(self, position):
+    def consume_resource(self, position: Tuple[int, int]):
         resource = self.simulation.resources.get(position)
         if resource and not resource.get('consumed', False):
             resource_type = resource['type']
@@ -1271,10 +1257,16 @@ class Simulation:
     def get_time_of_day(self):
         # Return 'day', 'night', or 'twilight' based on revolution
         revolution_in_day = self.revolution % Config.REVOLUTIONS_PER_WAVE
-        if revolution_in_day < 6 or revolution_in_day >= 18:
+        if (
+            revolution_in_day < (Config.REVOLUTIONS_PER_WAVE * 0.25)
+            or revolution_in_day >= (Config.REVOLUTIONS_PER_WAVE * 0.75)
+        ):
             return 'night'
-        elif 6 <= revolution_in_day < 8 or 16 <= revolution_in_day < 18:
-            return 'twilight'  # Dawn or Dusk
+        elif (
+            (Config.REVOLUTIONS_PER_WAVE * 0.25) <= revolution_in_day < (Config.REVOLUTIONS_PER_WAVE * 0.333333)
+            or (Config.REVOLUTIONS_PER_WAVE * 0.666666) <= revolution_in_day < (Config.REVOLUTIONS_PER_WAVE * 0.75)
+        ):
+            return 'twilight'
         else:
             return 'day'
 
