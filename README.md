@@ -69,21 +69,6 @@ Interact with the simulation through a user-friendly interface:
 *   **Real-Time Updates**: Observe how the ecosystem evolves with each tick of the simulation.
 *   **Event Log**: A running log captures significant events, providing insights into the dynamics at play.
 
-Roadmap
--------
-
-We have big plans for EvoSim! Here's what's coming:
-
-*   **🌐 Enhanced Visualization**: Upgrade the GUI with better graphics and interactive controls.
-*   **🦁 Predator-Prey Dynamics**: Introduce different species with predator and prey relationships.
-*   **🌪️ Environmental Events**: Implement weather patterns, natural disasters, and climate changes.
-*   **🧠 Neural Networks**: Evolve neural networks for creatures, leading to emergent behaviors.
-*   **📊 Data Analysis Tools**: Provide tools to analyze population genetics and evolutionary trends.
-*   **🎮 User Interaction**: Allow users to introduce new elements or influence the environment during the simulation.
-*   **💻 Web Version**: Develop a web-based version for easier accessibility.
-
-Stay tuned for updates and feel free to contribute your ideas!
-
 Keywords
 --------
 
