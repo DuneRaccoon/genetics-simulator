@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import random
-import tkinter as tk
-from tkinter import ttk
-from typing import List, Dict, Tuple, Union
 import heapq
 import math
+import time
+import tkinter as tk
+from tkinter import ttk
+from typing import List, Dict, Literal, Tuple, Union
 
 from config import Config
 
@@ -17,8 +18,10 @@ trait_weights = {}  # e.g. {'strength': 1.2, 'speed': 0.8, ...}
 
 MAX_MEMORY_CAPACITIY = 20
 MIN_MEMORY_CAPACITIY = 3
+DIVERSITY = 5 # Diversity of gene pool amongst population e.g. 5 means splitting population in 5 groups of n
 
-def split(x, y):
+def split_n(x: int, y: int):
+    # Split x into y parts
     return [x // y + (1 if x % y > i else 0) for i in range(y)]
 
 
@@ -42,12 +45,13 @@ class Creature:
         self.hunger = 0  # Hunger level (0 to 100)
         self.thirst = 0  # Thirst level (0 to 100)
         self.energy = 100  # Energy level (0 to 100)
+        self.health = 100.0
         self.calculate_traits()
         self.phenotype = self.express_phenotype()
         self.fitness = self.calculate_fitness()
         self.target = None  # Target position for pathfinding
         self.path = []      # Path to follow
-        self.known_resources: Dict[Tuple[int, int], Dict[str, any]] = {}  # Resources known to the creature
+        self.known_resources: Dict[Tuple[int, int], Resource] = {}
         self.reproduction_cooldown = 0  # Cooldown period after reproduction
         self.mate: Union[Creature, None] = None  # Current mate target
         self.reproduction_counter = 0  # Number of successful reproductions
@@ -66,14 +70,48 @@ class Creature:
             self.cycle_day = random.randint(1, self.cycle_length)  # Start at a random day in the cycle
 
     @property
-    def vision_range(self):
-        # Scale vision range based on vision trait, between 1 and 6 cells around self
+    def vision_range(self) -> int:
+        """
+        Scale vision range based on vision trait, between 1 and 6 cells around self
+        """
         return int(self.traits['vision'] * 5) + 1
     
     @property
     def memory_capacity(self):
         # Scale memory capacity based on intelligence trait
         return int(self.traits['intelligence'] * (MAX_MEMORY_CAPACITIY - MIN_MEMORY_CAPACITIY)) + MIN_MEMORY_CAPACITIY
+    
+    @property
+    def defensive_power(self):
+        endurance = self.traits.get('endurance') or 0.0
+        camouflage = self.traits.get('camouflage') or 0.0
+        speed = self.traits.get('speed') or 0.0
+        return (endurance * 0.6 + camouflage * 0.3 + speed * 0.1) * 50
+    
+    @property
+    def attack_power(self):
+        strength = self.traits.get('strength') or 0.0
+        aggression = self.traits.get('aggression') or 0.0
+        speed = self.traits.get('speed') or 0.0
+        return (strength * 0.6 + aggression * 0.3 + speed * 0.1) * 50
+    
+    @property
+    def critical_chance(self):
+        intelligence = self.traits.get('intelligence') or 0.0
+        aggression = self.traits.get('aggression') or 0.0
+        return (intelligence * 0.5 + aggression * 0.5) * 0.2  # Max 20% chance
+
+    @property
+    def evade_chance(self):
+        speed = self.traits.get('speed') or 0.0
+        intelligence = self.traits.get('intelligence') or 0.0
+        return (speed * 0.7 + intelligence * 0.3) * 0.5  # Max 50%
+    
+    @property
+    def hit_chance(self):
+        aggression = self.traits.get('aggression') or 0.0
+        intelligence = self.traits.get('intelligence') or 0.0
+        return (aggression * 0.7 + intelligence * 0.3) * 0.8
     
     def generate_chromosomes(self):
         # Each gene is a continuous value between 0 and 1
@@ -161,6 +199,36 @@ class Creature:
         b = min(max(0, b), 255)
 
         return f'#{r:02x}{g:02x}{b:02x}'
+    
+    def analyse_phenotype(self, creature: Creature):
+        """
+        Extract traits from a given creature's phenotype.
+        
+        Can be used by creatures with >= mid intelligence to analyze other creatures' traits.
+        """
+        
+        if self.traits['intelligence'] < 0.5:
+            return None
+        
+        r = int(creature.phenotype[1:3], 16)
+        g = int(creature.phenotype[3:5], 16)
+        b = int(creature.phenotype[5:7], 16)
+
+        # Scale RGB values to 0-1 range
+        r_avg = (r - 50) / 205
+        g_avg = (g - 50) / 205
+        b_avg = (b - 50) / 205
+
+        # Calculate trait values based on RGB channels
+        r_traits = ['aggression', 'strength', 'speed']
+        g_traits = ['camouflage', 'endurance', 'longevity']
+        b_traits = ['vision', 'intelligence', 'hearing']
+
+        traits = {}
+        for trait, value in zip(r_traits + g_traits + b_traits, [r_avg, g_avg, b_avg]):
+            traits[trait] = value
+
+        return traits
 
     def calculate_fitness(self):
         # Weighted fitness function
@@ -222,7 +290,11 @@ class Creature:
         return self.fitness < fitness_threshold and self.die("Fitness below threshold")
 
     def act(self):
-        # Decide action based on traits and needs
+        """
+        Each "frame" or "revolution" of the simulation, we call the act method to decide the creature's next "thought" and action.
+        
+        ALl actions should initiate from this method.
+        """
         if not self.alive:
             return
 
@@ -316,7 +388,7 @@ class Creature:
         # General movement
         self.move()
         
-    def find_resource_in_memory(self, resource_type):
+    def find_resource_in_memory(self, resource_type: Literal['food', 'water']):
         # Find the nearest remembered resource of the given type
         min_distance = None
         target = None
@@ -326,12 +398,13 @@ class Creature:
         # Clean up outdated memories (optional)
         self.cleanup_memory_resources()
 
-        for (x1, y1), res in self.memory_resources.items():
-            if res['type'] == resource_type:
+        for (x1, y1), resource in self.memory_resources.items():
+            if resource['resource'].type == resource_type:
                 distance = abs(x1 - x0) + abs(y1 - y0)
                 if min_distance is None or distance < min_distance:
                     min_distance = distance
                     target = (x1, y1)
+                    
         return target
 
     def find_mate_in_memory(self):
@@ -373,7 +446,7 @@ class Creature:
         # For example, remove memories older than a certain number of revolutions
         
         for position, resource in list(self.memory_resources.items()):
-            if resource.get('consumed', False):
+            if resource["resource"].consumed:
                 self.memory_resources.pop(position)
             elif resource.get('last_seen', 0) < self.simulation.total_revolutions - 10:
                 self.memory_resources.pop(position)
@@ -414,7 +487,7 @@ class Creature:
         if self.energy > 100:
             self.energy = 100
 
-    def determine_activity_level(self, time_of_day):
+    def determine_activity_level(self, time_of_day: Literal['day', 'night', 'twilight']):
         # Activity level is influenced by circadian traits and time of day
         if time_of_day == 'day':
             activity_trait = self.traits.get('diurnal_activity', 0.5)
@@ -445,13 +518,13 @@ class Creature:
                 # Check for resources
                 if (x, y) in self.simulation.resources:
                     resource = self.simulation.resources[(x, y)]
-                    if not resource.get('consumed', False):
+                    if not resource.consumed:
                         resource_info = {
-                            **resource,
-                            'position': (x, y),
+                            'resource': resource,
                             'last_seen': self.simulation.total_revolutions
                         }
                         observed_resources.append(((x, y), resource_info))
+                        self.known_resources[(x, y)] = resource
 
                 # Check for creatures
                 cell: Creature = self.simulation.grid[y][x]
@@ -488,23 +561,30 @@ class Creature:
             # Remove the oldest memory
             self.memory_creatures.pop(next(iter(self.memory_creatures)))
             
-    def find_resource(self, resource_type):
+    def find_resource(self, resource_type: Literal['food', 'water']):
+        # Clean up known_resources by removing resources that no longer exist
+        for pos in list(self.known_resources.keys()):
+            if pos not in self.simulation.resources:
+                del self.known_resources[pos]
+                
         # Find the nearest known resource of the given type
         min_distance = None
         target = None
         x0, y0 = self.position
-        for (x1, y1), res in self.known_resources.items():
-            if res['type'] == resource_type and not res.get('claimed', False) and not res.get('consumed', False):
+        for (x1, y1), resource in self.known_resources.items():
+            if resource.type == resource_type and not resource.claimed and not resource.consumed:
                 distance = abs(x1 - x0) + abs(y1 - y0)
                 if min_distance is None or distance < min_distance:
                     min_distance = distance
                     target = (x1, y1)
+                    
         # Claim the resource if found
         if target:
-            self.simulation.resources[target]['claimed'] = True
+            self.simulation.resources[target].claim()
             self.target_resource = target
         else:
             self.target_resource = None
+            
         return target
 
     def find_target(self):
@@ -547,7 +627,7 @@ class Creature:
                                 potential_mate = creature
         return potential_mate
 
-    def move_towards_target(self, target_position, attack_target: Creature = None, mate_target: Creature = None):
+    def move_towards_target(self, target_position: Tuple[int, int], attack_target: Creature = None, mate_target: Creature = None):
         # Check if target is still valid before moving
         if attack_target and not attack_target.alive:
             # Target is dead, abandon action
@@ -557,18 +637,22 @@ class Creature:
             self.have_thought("Mate no longer available")
             self.mate = None
             return
-        elif not attack_target and not mate_target and self.target_resource:
-            # Check if resource still exists and is not claimed or consumed
-            resource = self.simulation.resources.get(self.target_resource)
-            if not resource or resource.get('consumed', False):
+        elif not attack_target and not mate_target:
+            # Check if resource at target_position still exists
+            resource = self.simulation.resources.get(target_position)
+            if not resource or resource.consumed:
                 # Resource no longer available
                 self.have_thought("Resource no longer available")
+                if target_position in self.known_resources:
+                    del self.known_resources[target_position]
+                if target_position in self.memory_resources:
+                    del self.memory_resources[target_position]
                 self.target_resource = None
                 return
 
         # If moving towards a resource from memory, check if resource is still there upon arrival
         if not attack_target and not mate_target and self.position == target_position:
-            if (self.position in self.simulation.resources) and not self.simulation.resources[self.position].get('consumed', False):
+            if (self.position in self.simulation.resources) and not self.simulation.resources[self.position].consumed:
                 self.consume_resource(self.position)
             else:
                 # Resource is not there; remove it from memory
@@ -690,7 +774,7 @@ class Creature:
                 if child_position:
                     child = Creature(self.simulation, chromosomes=child_chromosomes, position=child_position)
                     self.simulation.new_offspring.append(child)
-                    self.simulation.events.append(f"{self.sex.capitalize()} at {self.position} and {mate.sex} at {mate.position} reproduced.")
+                    self.simulation.events.append(f"{self.sex.capitalize()} ({self.phenotype}) at {self.position} and {mate.sex} ({mate.phenotype}) at {mate.position} reproduced -> {child.phenotype}.")
                     self.reproduction_counter += 1
                     mate.reproduction_counter += 1
                     # Set reproduction cooldown
@@ -807,7 +891,7 @@ class Creature:
         cell = self.simulation.grid[y][x]
         if cell is None:
             score += 1  # Prefer empty cells
-        elif cell in ['food', 'water']:
+        elif isinstance(cell, Resource) and not cell.consumed and not cell.claimed:
             score += 5  # Prefer resource tiles
         elif isinstance(cell, Creature):
             # Avoid tiles with other creatures unless aggressive
@@ -820,43 +904,122 @@ class Creature:
         return score
 
     def attack(self, target: Creature):
-        # Simple attack logic
-        attack_power = self.traits['aggression'] * self.traits['strength']
-        defense_power = target.traits['endurance'] * target.traits['camouflage']
-        if attack_power > defense_power:
-            target.alive = False  # Target dies
-            target.cause_of_death = f"Killed by creature at {self.position}"
-            self.simulation.events.append(f"Creature at {self.position} killed creature at {target.position}")
-            self.simulation.add_to_graveyard(target)
-            # Consume the creature as food
-            self.consume_creature(target)
-        else:
-            self.simulation.events.append(f"Creature at {self.position} failed to kill creature at {target.position}")
+        hit_probability = max(min(self.hit_chance - target.evade_chance, 0.95), 0.05)  # Ensure between 5% and 95%
 
+        if random.random() < hit_probability: # Successful hit
+            attack_power = self.attack_power
+            
+            is_critical = random.random() < self.critical_chance
+        
+            if is_critical:
+                attack_power = attack_power * 1.5  # Critical hit deals 150% damage
+            else:
+                attack_power = attack_power
+                
+            damage = attack_power - target.defensive_power * 0.5  # Defense reduces damage by up to 50%
+            damage = max(damage, 0)  # No negative damage
+
+            # Apply damage to target
+            target.health -= damage
+
+            if is_critical:
+                self.simulation.events.append(
+                    f"Creature at {self.position} landed a critical hit on creature at {target.position} for {damage:.1f} damage."
+                )
+            else:
+                self.simulation.events.append(
+                    f"Creature at {self.position} attacked creature at {target.position} for {damage:.1f} damage."
+                )
+
+            if target.health <= 0:
+                target.die(f"Killed by creature at {self.position}")
+                self.simulation.events.append(
+                    f"Creature at {self.position} killed creature at {target.position}"
+                )
+                # Consume the creature as food
+                self.consume_creature(target)
+            else:
+                # Target is still alive
+                self.simulation.events.append(
+                    f"Creature at {target.position} has {target.health:.1f} health remaining."
+                )
+                # Target may counterattack if aggressive
+                if target.traits.get('aggression', 0.5) > 0.4:
+                    target.counterattack(self)
+        else:
+            self.simulation.events.append(
+                f"Creature at {self.position} failed attack on creature at {target.position}"
+            )
+            
+        self.simulation.attack_events.append({
+            'attacker_pos': self.position,
+            'target_pos': target.position,
+            'start_time': time.time(),  # Record the current time
+            'duration': 0.5  # Animation duration in seconds
+        })
+            
+    def counterattack(self, attacker: Creature):
+        # Same as attack, but without critical hits
+        hit_probability = max(min(self.hit_chance - attacker.evade_chance, 0.95), 0.05)  # Ensure between 5% and 95%
+
+        if random.random() < hit_probability: # Successful hit
+            damage = self.attack_power - attacker.defensive_power * 0.5
+            damage = max(damage, 0)  # No negative damage
+            attacker.health -= damage
+            
+            if attacker.health <= 0:
+                attacker.die(f"Killed in counterattack by creature at {self.position}")
+                self.simulation.events.append(
+                    f"Creature at {self.position} killed creature at {attacker.position} with a counterattack"
+                )
+                # Counterattacker consumes the attacker as food
+                self.consume_creature(attacker)
+            else:
+                self.simulation.events.append(
+                    f"Creature at {attacker.position} has {attacker.health:.1f} health remaining."
+                )
+        else:
+            self.simulation.events.append(
+                f"Creature at {self.position} missed counterattack on creature at {attacker.position}"
+            )
+            
+        self.simulation.attack_events.append({
+            'attacker_pos': self.position,
+            'target_pos': attacker.position,
+            'start_time': time.time(),
+            'duration': 0.5  # Animation duration in seconds
+        })
+            
     def consume_resource(self, position: Tuple[int, int]):
         resource = self.simulation.resources.get(position)
-        if resource and not resource.get('consumed', False):
-            resource_type = resource['type']
-            resource['consumed'] = True  # Mark resource as consumed
-            if resource_type == 'food':
-                self.hunger = max(self.hunger - 50, 0)
-                self.energy = min(self.energy + 30, 100)  # Regain energy
-            elif resource_type == 'water':
-                self.thirst = max(self.thirst - 50, 0)
-                self.energy = min(self.energy + 10, 100)  # Regain some energy
-            self.simulation.events.append(f"Creature at {self.position} consumed {resource_type}")
+        if resource and not resource.consumed:
+            resource.consume()
+            if resource.type == 'food':
+                self.hunger = max(self.hunger - 15, 0)
+                self.energy = min(self.energy + 10, 100)  # Regain energy
+                self.health = min(self.health + 10, 100)  # Gain health from consuming
+            elif resource.type == 'water':
+                self.thirst = max(self.thirst - 15, 0)
+                self.energy = min(self.energy + 5, 100)  # Regain some energy
+                self.health = min(self.health + 5, 100)  # Gain health from consuming
+            self.simulation.events.append(f"Creature at {self.position} consumed {resource.type}")
             self.target_resource = None
-            # Remove resource from simulation
-            del self.simulation.resources[position]
         else:
             # Resource no longer available
             self.target_resource = None
             self.have_thought("Resource no longer available")
+            
+        if position in self.known_resources:
+            del self.known_resources[position]
+            
+        if position in self.memory_resources:
+            del self.memory_resources[position]
 
     def consume_creature(self, target: Creature):
         # Consuming the defeated creature reduces hunger significantly
         self.hunger = max(self.hunger - 70, 0)
         self.energy = min(self.energy + 50, 100)  # Regain significant energy
+        self.health = min(self.health + 30, 100)  # Gain health from consuming
         self.simulation.events.append(f"Creature at {self.position} consumed creature at {target.position}")
 
     def random_adjacent_position(self):
@@ -934,7 +1097,7 @@ class Creature:
         closed_set_start = set()
         closed_set_goal = set()
 
-        max_iterations = 200  # Adjust as needed
+        max_iterations = 200  # Limit to prevent excessive computation
         iterations = 0
 
         while open_set_start and open_set_goal and iterations < max_iterations:
@@ -1060,6 +1223,53 @@ class Creature:
         return full_path[1:]
 
 
+class Resource:
+    
+    """
+    Class representing a resource in the simulation.
+    
+    Resources can only exist within a simulation.
+    """
+    
+    TYPES = ['food', 'water'] 
+    
+    COLOURS = {
+        'food': 'yellow',
+        'water': 'blue'
+    }
+    
+    def __init__(
+        self,
+        simulation: Simulation,
+        *,
+        resource_type: Literal['food', 'water'],
+        position: Tuple[int, int]
+    ):
+        self.simulation = simulation
+        self.type = resource_type
+        self.position = position
+        self.claimed = False
+        self.consumed = False
+        self.last_seen = 0
+        
+    def __repr__(self):
+        return f"Resource(type={self.type}, position={self.position}, claimed={self.claimed}, consumed={self.consumed})"
+    
+    @property
+    def color(self):
+        return self.COLOURS[self.type]
+    
+    def consume(self):
+        """
+        Consume the resource and then remove it from the simulation.
+        """
+        self.consumed = True
+        # Remove resource from simulation
+        del self.simulation.resources[self.position]
+        
+    def claim(self):
+        self.claimed = True
+
 class Simulation:
     def __init__(self):
 
@@ -1072,18 +1282,20 @@ class Simulation:
         self.environmental_factors = self.generate_environmental_factors()
         self.grid = self.create_grid()
         self.obstacles = set()
-        self.resources: Dict[Tuple[int, int], Dict[str, Union[str, bool]]] = {}  # {(x, y): {'type': 'food', 'claimed': False}}
+        self.resources: Dict[Tuple[int, int], Resource] = {}
         self.events: List[str] = []
+        self.attack_events = []
         self.total_revolutions: int = 0
         self.gui: SimulationGUI = None  # Reference to GUI
         self.graveyard: List[Creature] = []  # List to store dead creatures
 
         self.place_obstacles()
         self.place_resources()
-
+        
         # Diversify gene and trait mapping
-        self.generate_gene_names_and_traits()
-        self.create_population()
+        for n in split_n(self.population_size, DIVERSITY):
+            self.generate_gene_names_and_traits()
+            self.create_population(n)
 
         self.update_stats()
 
@@ -1154,10 +1366,10 @@ class Simulation:
         # Environmental factors can affect the fitness calculation
         factors = {
             'temperature': random.uniform(0, 1),  # 0: cold, 1: hot
-            'predation': random.uniform(0, 1),    # Level of predation
-            'resource_abundance': random.uniform(0, 1),  # Availability of resources
-            'disease': random.uniform(0, 1),      # Disease prevalence
-            'natural_disasters': random.uniform(0, 1)  # Frequency of natural disasters
+            'predation': random.uniform(0, 1),    # Level of predation: 0: low, 1: high
+            'resource_abundance': random.uniform(0, 1),  # Availability of resources: 0: scarce, 1: abundant
+            'disease': random.uniform(0, 1),      # Disease prevalence: 0: low, 1: high
+            'natural_disasters': random.uniform(0, 1)  # Frequency of natural disasters: 0: rare, 1: frequent
         }
         return factors
 
@@ -1181,17 +1393,12 @@ class Simulation:
             x = random.randint(0, Config.GRID_SIZE - 1)
             y = random.randint(0, Config.GRID_SIZE - 1)
             if (x, y) not in self.obstacles and (x, y) not in self.resources:
-                res_type = random.choice(resource_types)
-                self.resources[(x, y)] = {
-                    "type": res_type,
-                    "claimed": False,
-                    "consumed": False
-                }
+                resource_type = random.choice(resource_types)
+                self.resources[(x, y)] = Resource(self, resource_type=resource_type, position=(x, y))
 
-    def create_population(self):
-        # Ensure creatures don't spawn on obstacles or resources
-        for _ in range(self.population_size):
-            position = self.random_free_position()
+    def create_population(self, n: int):
+        for _ in range(n):
+            position = self.random_free_position() # Ensure creatures don't spawn on obstacles or resources
             creature = Creature(self, position=position)
             self.population.append(creature)
 
@@ -1238,19 +1445,24 @@ class Simulation:
         self.events.append(f"Revolution {self.revolution} in Wave {self.wave}, Epoch {self.epoch}")
         self.total_revolutions += 1
         self.update_stats()
+        
         # Process each creature individually
         for creature in self.population:
             if creature.alive:
                 creature.act()
                 creature.cooldown()
-        # Update grid once after all creatures have acted
-        self.update_grid()
+        
         # Remove consumed resources
-        self.resources = {pos: res for pos, res in self.resources.items() if not res.get('consumed', False)}
+        self.resources = {pos: res for pos, res in self.resources.items() if not res.consumed}
+             
+        # Update grid once after all creatures have acted and resources have been consumed
+        self.update_grid()
+        
         # Add new offspring to the population
         if self.new_offspring:
             self.population.extend(self.new_offspring)
             self.new_offspring = []
+            
         # Update grid after adding offspring
         self.update_grid()
 
@@ -1275,10 +1487,20 @@ class Simulation:
         for creature in self.population[:]:  # Make a copy to avoid modification issues
             if creature.alive:
                 if creature.increase_hunger_thirst():
-                    self.population.remove(creature)
+                    try:
+                        self.population.remove(creature)
+                    except ValueError:
+                        pass
 
     def add_to_graveyard(self, creature: Creature):
         self.graveyard.append(creature)
+        x, y = creature.position
+        self.grid[y][x] = None
+        try:
+            # Remove from population
+            self.population.remove(creature)
+        except ValueError:
+            pass
 
     def is_simulation_complete(self):
         return self.epoch >= Config.NUM_EPOCHS or len(self.population) == 0
@@ -1287,8 +1509,8 @@ class Simulation:
         self.grid = [[None for _ in range(Config.GRID_SIZE)] for _ in range(Config.GRID_SIZE)]
         for x, y in self.obstacles:
             self.grid[y][x] = 'obstacle'
-        for (x, y), res in self.resources.items():
-            self.grid[y][x] = res['type']
+        for (x, y), resource in self.resources.items():
+            self.grid[y][x] = resource
         for creature in self.population:
             if creature.alive:
                 x, y = creature.position
@@ -1298,7 +1520,7 @@ class Simulation:
         x %= Config.GRID_SIZE
         y %= Config.GRID_SIZE
         cell = self.grid[y][x]
-        return cell is None or cell in ['food', 'water']
+        return cell is None or isinstance(cell, Resource)
 
     def get_adjacent_positions(self, x, y):
         positions = []
@@ -1347,7 +1569,10 @@ class Simulation:
         for creature in self.population[:]:  # Copy the list to avoid issues
             if creature.alive:
                 if creature.age_creature():
-                    self.population.remove(creature)
+                    try:
+                        self.population.remove(creature)
+                    except ValueError:
+                        pass
 
     def update_stats(self):
         # Calculate stats for GUI display
@@ -1369,6 +1594,7 @@ class SimulationGUI:
         self.paused = False
         self.selected_creature = None
         self.last_event_index = 0  # For efficient event log updates
+        self.animations = []
         self.create_configuration_interface()
 
     def create_configuration_interface(self):
@@ -1445,6 +1671,10 @@ class SimulationGUI:
         # Graveyard Tab
         self.graveyard_frame = tk.Frame(self.notebook)
         self.notebook.add(self.graveyard_frame, text="Graveyard")
+        
+        # Eventlog Tab
+        self.event_log_frame = tk.Frame(self.notebook)
+        self.notebook.add(self.event_log_frame, text="Event Log")
 
         # Create canvas for the grid in simulation tab
         self.canvas = tk.Canvas(self.simulation_frame, width=self.canvas_size, height=self.canvas_size)
@@ -1505,6 +1735,16 @@ class SimulationGUI:
         self.graveyard_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.graveyard_listbox.config(yscrollcommand=self.graveyard_scrollbar.set)
         self.graveyard_scrollbar.config(command=self.graveyard_listbox.yview)
+        
+        # Eventlog listbox in the eventlog tab
+        self.event_log_frame_listbox = tk.Listbox(self.event_log_frame, width=80)
+        self.event_log_frame_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Scrollbar for the eventlog listbox
+        self.event_log_frame_scrollbar = tk.Scrollbar(self.event_log_frame)
+        self.event_log_frame_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.event_log_frame_listbox.config(yscrollcommand=self.event_log_frame_scrollbar.set)
+        self.event_log_frame_scrollbar.config(command=self.event_log_frame_listbox.yview)
 
         self.draw_population()
         self.root.after(1000, self.run_simulation)  # Start simulation after 1 second
@@ -1533,8 +1773,7 @@ class SimulationGUI:
                     self.canvas.create_rectangle(x0, y0, x1, y1, fill='gray', outline="")
                 elif (x, y) in self.simulation.resources:
                     resource = self.simulation.resources[(x, y)]
-                    color = 'yellow' if resource["type"] == 'food' else 'blue'
-                    self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
+                    self.canvas.create_rectangle(x0, y0, x1, y1, fill=resource.color, outline="")
 
         # Draw creatures
         for creature in self.simulation.population:
@@ -1553,12 +1792,57 @@ class SimulationGUI:
                 self.canvas.create_rectangle(
                     x0, y0, x1, y1, fill=creature.phenotype, outline=outline_color, width=outline_width
                 )
-
+                
+        self.draw_animations(cell_size)
+        
         # Update stats and event log
         self.update_stats_display()
         self.update_event_log()
+        self.update_event_log_frame()
         self.update_selected_creature_info()  # Update selected creature info
 
+    def draw_animations(self, cell_size: int):
+        
+        current_time = time.time()
+        
+        # Remove expired animations
+        self.animations = [
+            anim for anim in self.animations
+            if current_time - anim['start_time'] < anim['duration']
+        ]
+        
+        # Add new attack events to animations
+        while self.simulation.attack_events:
+            event = self.simulation.attack_events.pop(0)
+            self.animations.append(event)
+
+        for anim in self.animations:
+            attacker_x, attacker_y = anim['attacker_pos']
+            target_x, target_y = anim['target_pos']
+
+            # Calculate pixel positions
+            ax = attacker_x * cell_size + cell_size // 2
+            ay = attacker_y * cell_size + cell_size // 2
+            tx = target_x * cell_size + cell_size // 2
+            ty = target_y * cell_size + cell_size // 2
+
+            # Draw a line between attacker and target
+            self.canvas.create_line(ax, ay, tx, ty, fill='red', width=2)
+
+            # Draw a flashing circle at the target
+            elapsed = current_time - anim['start_time']
+            # Make the circle flash by changing its color based on time
+            if int(elapsed * 10) % 2 == 0:
+                circle_color = 'red'
+            else:
+                circle_color = 'yellow'
+
+            self.canvas.create_oval(
+                tx - cell_size // 4, ty - cell_size // 4,
+                tx + cell_size // 4, ty + cell_size // 4,
+                outline=circle_color, width=2
+            )
+        
     def on_mouse_click(self, event):
         # Calculate grid position from mouse coordinates
         cell_size = self.canvas_size // Config.GRID_SIZE
@@ -1584,6 +1868,7 @@ class SimulationGUI:
         if c and c.alive:
             info = f"Selected Creature at ({c.position[0]}, {c.position[1]}):\n"
             info += f"Sex: {c.sex.capitalize()}\n"
+            info += f"Health: {c.health:.1f}\n"
             info += f"Current Thought: {c.current_thought}\n"
             for trait, value in c.traits.items():
                 info += f"{trait.capitalize()}: {value:.2f}\n"
@@ -1591,6 +1876,7 @@ class SimulationGUI:
             info += f"Thirst: {c.thirst:.1f}\n"
             info += f"Energy: {c.energy:.1f}\n"
             info += f"Age: {c.age}\n"
+            info += f"Reproduction Count: {c.reproduction_counter}\n"
             if c.sex == 'female':
                 info += f"Cycle Day: {c.cycle_day}/{c.cycle_length}\n"
             # Display memory capacity and current memory usage
@@ -1629,7 +1915,7 @@ class SimulationGUI:
         else:
             if (x, y) in self.simulation.resources:
                 resource = self.simulation.resources[(x, y)]
-                info += f'Resource at ({x}, {y}): {resource["type"].capitalize()}\n'
+                info += f'Resource at ({x}, {y}): {resource.type.capitalize()}\n'
             elif (x, y) in self.simulation.obstacles:
                 info += f"Obstacle at ({x}, {y})\n"
             else:
@@ -1649,6 +1935,7 @@ class SimulationGUI:
                 self.draw_population()
                 self.root.after(100, self.run_simulation)
         else:
+            self.draw_population()
             self.root.after(100, self.run_simulation)
 
     def update_graveyard(self):
@@ -1658,7 +1945,7 @@ class SimulationGUI:
             info = f"{idx}. Age: {creature.age}, Cause of Death: {creature.cause_of_death}, Traits: "
             traits_info = ', '.join(f"{trait}: {value:.2f}" for trait, value in creature.traits.items())
             self.graveyard_listbox.insert(tk.END, info + traits_info)
-
+            
     def pause_simulation(self):
         self.paused = True
 
@@ -1687,6 +1974,17 @@ class SimulationGUI:
             self.event_log_text.see(tk.END)  # Scroll to the end
             self.event_log_text.config(state='disabled')
             self.last_event_index = len(self.simulation.events)
+            
+    def update_event_log_frame(self):
+        if self.simulation is None:
+            return
+        new_events = self.simulation.events[self.last_event_index:]
+        if new_events:
+            self.event_log_frame_listbox.delete(0, tk.END)
+            for event in new_events:
+                self.event_log_frame_listbox.insert(tk.END, event)
+            self.event_log_frame_listbox.see(tk.END)
+    
 
     def run(self):
         self.root.mainloop()
